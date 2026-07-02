@@ -25,6 +25,11 @@ air — no USB needed after the first flash.
 
 ## Hardware
 
+Built and tested exclusively for the **[Seeed Studio XIAO ESP32S3 Sense](https://www.amazon.com/dp/B0C69FFVHH)**
+(the "Sense" variant with the camera + microphone + microSD expansion board — the
+plain XIAO ESP32S3 lacks these). Also available from the
+[Seeed Studio store](https://www.seeedstudio.com/XIAO-ESP32S3-Sense-p-5639.html).
+
 | | |
 |---|---|
 | Board | Seeed Studio XIAO ESP32S3 Sense |
@@ -34,6 +39,22 @@ air — no USB needed after the first flash.
 | microSD | SDMMC 1-bit — CLK=GPIO7, CMD=GPIO9, D0=GPIO8 |
 | Flash | 8 MB |
 | PSRAM | 8 MB octal |
+
+## Porting to another board
+
+All board-specific pins live in one block at the top of `main/webcam.c`, marked
+`===== BOARD CONFIG =====` (camera, microSD, and microphone `#define`s).
+
+- **Another ESP32-S3 board with camera + PSRAM** (Freenove ESP32-S3-CAM,
+  ESP32-S3-EYE, other XIAO-S3): edit those pin defines and set the flash/PSRAM
+  size in `sdkconfig.defaults`. That's it.
+- **Original ESP32-CAM (AI-Thinker)**: camera works with pin changes, but the
+  classic ESP32 routes the camera through I2S, so a PDM mic conflicts — audio
+  recording and on-device wake-word are not available there.
+- **ESP32-P4 / S2 / C-series**: not a drop-in — different (or absent) camera
+  peripheral. Expect real rework, not just pins.
+
+Keep `idf.py set-target` matching your chip (this repo targets `esp32s3`).
 
 ## HTTP Endpoints
 

@@ -82,6 +82,12 @@ static bool form_get_value(const char *body, const char *key, char *dst, size_t 
 static bool ssid_is_scanned(const char *ssid);
 static bool wifi_password_is_valid(const char *pass);
 static bool framesize_from_name(const char *name, framesize_t *framesize);
+
+/* ============================== BOARD CONFIG ==============================
+ * Pin map for the Seeed XIAO ESP32S3 Sense. To adapt to another ESP32-S3
+ * camera board, change the camera / microSD / microphone pins below and set
+ * the flash & PSRAM size in sdkconfig.defaults. See README "Porting".
+ * ========================================================================= */
 #define CAM_PIN_PWDN   -1
 #define CAM_PIN_RESET  -1
 #define CAM_PIN_XCLK   10
