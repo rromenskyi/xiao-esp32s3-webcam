@@ -27,6 +27,10 @@
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+#include "esp_timer.h"
+#include <sys/statvfs.h>
 #include "mdns.h"
 #include "esp_netif_sntp.h"
 #include "esp_sntp.h"
@@ -64,11 +68,14 @@ static esp_err_t wifi_add_handler(httpd_req_t *req);
 static esp_err_t wifi_del_handler(httpd_req_t *req);
 static esp_err_t time_handler(httpd_req_t *req);
 static esp_err_t ntp_handler(httpd_req_t *req);
+static esp_err_t sysinfo_handler(httpd_req_t *req);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
 static esp_err_t download_handler(httpd_req_t *req);
 static esp_err_t delete_handler(httpd_req_t *req);
+static esp_err_t rename_handler(httpd_req_t *req);
+static esp_err_t copy_handler(httpd_req_t *req);
 static void rec_enforce_budget(void);
 static esp_err_t init_sd_card(void);
 static esp_err_t mount_sd_card(bool format_if_mount_failed);
@@ -924,8 +931,11 @@ static esp_err_t rec_list_handler(httpd_req_t *req) {
             char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", e->d_name);
             struct stat st; if (stat(full, &st) != 0) continue;
             used += st.st_size;
-            char item[320];
-            snprintf(item, sizeof(item), "%s{\"name\":\"%s\",\"size\":%lld}", first ? "" : ",", e->d_name, (long long)st.st_size);
+            char mt[24]; struct tm tmv; localtime_r(&st.st_mtime, &tmv);
+            strftime(mt, sizeof(mt), "%Y-%m-%d %H:%M", &tmv);
+            char item[360];
+            snprintf(item, sizeof(item), "%s{\"name\":\"%s\",\"size\":%lld,\"mtime\":\"%s\"}",
+                     first ? "" : ",", e->d_name, (long long)st.st_size, mt);
             first = false;
             httpd_resp_sendstr_chunk(req, item);
         }
@@ -962,9 +972,11 @@ static esp_err_t files_list_handler(httpd_req_t *req) {
         char full[400]; snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
         struct stat st; if (stat(full, &st) != 0) continue;
         char esc[128]; json_escape_string(esc, sizeof(esc), e->d_name);
-        char item[256];
-        snprintf(item, sizeof(item), "%s{\"name\":\"%s\",\"dir\":%s,\"size\":%lld}",
-                 first ? "" : ",", esc, S_ISDIR(st.st_mode) ? "true" : "false", (long long)st.st_size);
+        char mt[24]; struct tm tmv; localtime_r(&st.st_mtime, &tmv);
+        strftime(mt, sizeof(mt), "%Y-%m-%d %H:%M", &tmv);
+        char item[360];
+        snprintf(item, sizeof(item), "%s{\"name\":\"%s\",\"dir\":%s,\"size\":%lld,\"mtime\":\"%s\"}",
+                 first ? "" : ",", esc, S_ISDIR(st.st_mode) ? "true" : "false", (long long)st.st_size, mt);
         first = false;
         httpd_resp_sendstr_chunk(req, item);
     }
@@ -988,10 +1000,15 @@ static esp_err_t download_handler(httpd_req_t *req) {
                              strstr(path, ".wav") ? "audio/wav" : "application/octet-stream");
     char cd[300]; snprintf(cd, sizeof(cd), "attachment; filename=\"%s\"", bn);
     httpd_resp_set_hdr(req, "Content-Disposition", cd);
-    char *buf = malloc(4096);
+    /* Disable Nagle for bulk transfer throughput on this socket. */
+    int sock = httpd_req_to_sockfd(req);
+    int one = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    const size_t DLBUF = 16384;
+    char *buf = malloc(DLBUF);
     if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
     size_t r; esp_err_t res = ESP_OK;
-    while ((r = fread(buf, 1, 4096, f)) > 0) {
+    while ((r = fread(buf, 1, DLBUF, f)) > 0) {
         if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) { res = ESP_FAIL; break; }
     }
     free(buf); fclose(f);
@@ -1010,6 +1027,79 @@ static esp_err_t delete_handler(httpd_req_t *req) {
     if (unlink(path) != 0) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "delete failed"); return ESP_FAIL; }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+/* Parse src+dst query params, both confined to /sdcard. */
+static bool sd_two_paths(httpd_req_t *req, char *src, size_t sl, char *dst, size_t dl) {
+    char q[420], v[200];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK) return false;
+    src[0] = dst[0] = '\0';
+    if (httpd_query_key_value(q, "src", v, sizeof(v)) == ESP_OK) url_decode(src, v, sl);
+    if (httpd_query_key_value(q, "dst", v, sizeof(v)) == ESP_OK) url_decode(dst, v, dl);
+    return sd_path_ok(src) && sd_path_ok(dst);
+}
+
+static esp_err_t rename_handler(httpd_req_t *req) {
+    char src[180], dst[180];
+    if (!sd_two_paths(req, src, sizeof(src), dst, sizeof(dst))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad src/dst"); return ESP_FAIL;
+    }
+    if (rename(src, dst) != 0) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "rename failed"); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t copy_handler(httpd_req_t *req) {
+    char src[180], dst[180];
+    if (!sd_two_paths(req, src, sizeof(src), dst, sizeof(dst))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad src/dst"); return ESP_FAIL;
+    }
+    FILE *in = fopen(src, "rb");
+    if (!in) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "src not found"); return ESP_FAIL; }
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "cannot create dst"); return ESP_FAIL; }
+    char *buf = malloc(16384);
+    bool ok = buf != NULL;
+    size_t r;
+    while (ok && (r = fread(buf, 1, 16384, in)) > 0) {
+        if (fwrite(buf, 1, r, out) != r) ok = false;
+    }
+    free(buf);
+    fclose(in);
+    fclose(out);
+    if (!ok) { unlink(dst); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "copy failed"); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t sysinfo_handler(httpd_req_t *req) {
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+    const char *model = chip.model == CHIP_ESP32S3 ? "ESP32-S3" : "ESP32";
+    uint32_t flash_sz = 0;
+    esp_flash_get_size(NULL, &flash_sz);
+    size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t heap_tot  = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    size_t ps_free   = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t ps_tot    = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    uint64_t up = esp_timer_get_time() / 1000000ULL;
+    uint64_t sd_tot = 0, sd_free = 0;
+    if (sd_ready) esp_vfs_fat_info(SD_MOUNT_POINT, &sd_tot, &sd_free);
+    const esp_app_desc_t *app = esp_app_get_description();
+
+    char body[512];
+    snprintf(body, sizeof(body),
+        "{\"chip\":\"%s\",\"cores\":%d,\"rev\":%d,\"cpu_mhz\":%d,"
+        "\"flash_mb\":%u,\"heap_free\":%u,\"heap_total\":%u,"
+        "\"psram_free\":%u,\"psram_total\":%u,"
+        "\"sd_free\":%llu,\"sd_total\":%llu,\"uptime\":%llu,\"idf\":\"%s\"}",
+        model, chip.cores, chip.revision, CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        (unsigned)(flash_sz / (1024 * 1024)), (unsigned)heap_free, (unsigned)heap_tot,
+        (unsigned)ps_free, (unsigned)ps_tot,
+        (unsigned long long)sd_free, (unsigned long long)sd_tot,
+        (unsigned long long)up, app->idf_ver);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
 }
 
 /* Back up the current config (incl. WiFi creds from NVS) to the SD card. */
@@ -1033,9 +1123,21 @@ static esp_err_t wifi_list_handler(httpd_req_t *req) {
         snprintf(item, sizeof(item), "%s\"%s\"", i ? "," : "", esc);
         httpd_resp_sendstr_chunk(req, item);
     }
-    char tail[80];
-    snprintf(tail, sizeof(tail), "],\"count\":%d,\"max\":%d,\"current\":\"%s\"}",
-             wifi_cred_count, WIFI_MAX_CREDS, device_ip[0] ? device_ip : "");
+    wifi_ap_record_t ap;
+    int rssi = 0, ch = 0;
+    char apssid[33] = "";
+    const char *phy = "-";
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        rssi = ap.rssi; ch = ap.primary;
+        strlcpy(apssid, (const char *)ap.ssid, sizeof(apssid));
+        phy = ap.phy_11n ? "11n" : ap.phy_11g ? "11g" : ap.phy_11b ? "11b" : "-";
+    }
+    char apesc[64];
+    json_escape_string(apesc, sizeof(apesc), apssid);
+    char tail[256];
+    snprintf(tail, sizeof(tail),
+             "],\"count\":%d,\"max\":%d,\"current\":\"%s\",\"ap\":\"%s\",\"rssi\":%d,\"ch\":%d,\"phy\":\"%s\"}",
+             wifi_cred_count, WIFI_MAX_CREDS, device_ip[0] ? device_ip : "", apesc, rssi, ch, phy);
     httpd_resp_sendstr_chunk(req, tail);
     return httpd_resp_sendstr_chunk(req, NULL);
 }
@@ -1611,6 +1713,9 @@ static esp_err_t index_handler(httpd_req_t *req) {
         ".toolbar{display:flex;gap:10px;margin:14px 0;flex-wrap:wrap}"
         ".btn{flex:1;min-width:120px;height:44px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text);font-weight:600;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;transition:.15s}"
         ".btn:hover{border-color:var(--accent);background:#1e2a33}.btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-d));border:0;color:#052723}.btn.danger:hover{border-color:var(--danger);color:#ff8b8e}"
+        ".lnk{background:none;border:0;color:var(--accent);cursor:pointer;font-size:13px;padding:0 5px;text-decoration:none}.lnk.danger{color:var(--danger)}"
+        "table.fb{width:100%;border-collapse:collapse;font-size:13px}table.fb th{text-align:left;color:var(--muted);font-weight:600;padding:6px 4px;border-bottom:1px solid var(--line)}table.fb td{padding:6px 4px;border-bottom:1px solid var(--line);vertical-align:middle}"
+        ".kv{display:grid;grid-template-columns:1fr 1fr;gap:6px 16px}.kv div{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:13px}.kv b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums}"
         ".card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:18px;margin-top:14px}.card h3{margin:0 0 14px;font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--muted)}"
         ".grid{display:grid;grid-template-columns:1fr 1fr;gap:16px 22px}"
         ".ctl label{display:block;font-size:13px;color:var(--muted);margin:0 0 8px}.ctl .row{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}.ctl .row label{margin:0}.ctl .val{font-variant-numeric:tabular-nums;color:var(--text);font-weight:600;font-size:13px}"
@@ -1715,12 +1820,30 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
         "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
         "</section>"
+        "<section class='card'><h3>System</h3><div class='kv' id='sysinfo'></div></section>"
         "<section class='card'><h3>Time</h3>"
         "<div class='meta' style='margin:0 0 10px'><span id='clock' style='font-variant-numeric:tabular-nums;font-size:16px;color:var(--text)'>--:--:--</span><span id='ntpState'>NTP off</span></div>"
         "<div class='toolbar' style='margin:0'>"
         "<label class='btn' style='cursor:pointer;gap:10px'>Enable NTP<input id='ntpOn' type='checkbox' style='width:18px;height:18px'></label>"
-        "<input id='tz' placeholder='TZ e.g. EET-2EEST,M3.5.0/3,M10.5.0/4' style='flex:2;min-width:150px;height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:0 10px'>"
-        "<button class='btn primary' id='tzSave' type='button'>Save TZ</button>"
+        "<select id='tz' style='flex:2;min-width:170px;height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:0 10px'>"
+        "<option value='UTC0'>UTC</option>"
+        "<option value='GMT0BST,M3.5.0/1,M10.5.0'>Europe/London, Dublin, Lisbon</option>"
+        "<option value='CET-1CEST,M3.5.0,M10.5.0/3'>Europe/Berlin, Paris, Madrid, Rome</option>"
+        "<option value='EET-2EEST,M3.5.0/3,M10.5.0/4'>Europe/Kyiv, Athens, Helsinki</option>"
+        "<option value='MSK-3'>Europe/Moscow, Istanbul</option>"
+        "<option value='&lt;-03&gt;3'>America/Sao Paulo, Buenos Aires</option>"
+        "<option value='EST5EDT,M3.2.0,M11.1.0'>America/New York, Toronto</option>"
+        "<option value='CST6CDT,M3.2.0,M11.1.0'>America/Chicago, Mexico City</option>"
+        "<option value='MST7MDT,M3.2.0,M11.1.0'>America/Denver</option>"
+        "<option value='PST8PDT,M3.2.0,M11.1.0'>America/Los Angeles, Vancouver</option>"
+        "<option value='&lt;+04&gt;-4'>Asia/Dubai, Tbilisi</option>"
+        "<option value='IST-5:30'>Asia/Kolkata, Mumbai</option>"
+        "<option value='&lt;+07&gt;-7'>Asia/Bangkok, Jakarta</option>"
+        "<option value='CST-8'>Asia/Shanghai, Singapore, Perth</option>"
+        "<option value='JST-9'>Asia/Tokyo, Seoul</option>"
+        "<option value='AEST-10AEDT,M10.1.0,M4.1.0/3'>Australia/Sydney, Melbourne</option>"
+        "<option value='NZST-12NZDT,M9.5.0,M4.1.0/3'>Pacific/Auckland</option>"
+        "</select>"
         "</div>"
         "</section>"
         "<section class='card'><h3>WiFi networks</h3>"
@@ -1768,7 +1891,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "document.getElementById('recUse').textContent=((d.used/1048576)|0)+' MB / '+((budget/1048576)|0)+' MB';"
         "if(document.activeElement!==recPct){recPct.value=d.pct;document.getElementById('recPctV').textContent=d.pct+'%';}"
         "var _rs=document.getElementById('recSeg');if(document.activeElement!==_rs){_rs.value=d.seg;document.getElementById('recSegV').textContent=d.seg+' min';}"
-        "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML=\"<span>\"+cl.name+' ('+((cl.size/1048576)|0)+' MB)</span>';const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);c.appendChild(r);});}catch(e){}}"
+        "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML=\"<span>\"+cl.name+' ('+((cl.size/1048576)|0)+' MB)'+(cl.mtime?'  ·  '+cl.mtime:'')+'</span>';const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);c.appendChild(r);});}catch(e){}}"
         "recBtn.onclick=async()=>{await fetch('/rec?on='+(recBtn.textContent.startsWith('Start')?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "document.getElementById('recAudio').onchange=async e=>{await fetch('/rec?audio='+(e.target.checked?1:0),{method:'POST'});};"
         "recPct.addEventListener('input',()=>document.getElementById('recPctV').textContent=recPct.value+'%');"
@@ -1778,15 +1901,31 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "setInterval(recRefresh,3000);recRefresh();"
         /* SD file browser */
         "let fbCur='/sdcard';"
-        "async function fbLoad(p){try{const r=await fetch('/files?dir='+encodeURIComponent(p));if(!r.ok)return;const d=await r.json();fbCur=d.dir;document.getElementById('fbPath').textContent=d.dir;const l=document.getElementById('fbList');l.innerHTML='';d.entries.sort((a,b)=>(b.dir-a.dir)||a.name.localeCompare(b.name)).forEach(en=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';const s=document.createElement('span');s.textContent=(en.dir?'[dir] ':'')+en.name+(en.dir?'':' ('+((en.size/1024)|0)+' KB)');if(en.dir){s.style.cursor='pointer';s.onclick=()=>fbLoad(d.dir+'/'+en.name);}row.appendChild(s);if(!en.dir){const w=document.createElement('span');const g=document.createElement('a');g.className='btn';g.style.cssText='flex:0;min-width:70px;height:30px';g.textContent='Get';g.href='/download?path='+encodeURIComponent(d.dir+'/'+en.name);const del=document.createElement('button');del.className='btn danger';del.type='button';del.style.cssText='flex:0;min-width:64px;height:30px;margin-left:6px';del.textContent='Del';del.onclick=async()=>{if(confirm('Delete '+en.name+'?')){await fetch('/delete?path='+encodeURIComponent(d.dir+'/'+en.name),{method:'POST'});fbLoad(fbCur);}};w.appendChild(g);w.appendChild(del);row.appendChild(w);}l.appendChild(row);});}catch(e){}}"
+        "function fbSize(n){return n>1048576?(n/1048576).toFixed(1)+' MB':((n/1024)|0)+' KB';}"
+        "async function fbLoad(p){try{const r=await fetch('/files?dir='+encodeURIComponent(p));if(!r.ok)return;const d=await r.json();fbCur=d.dir;document.getElementById('fbPath').textContent=d.dir;"
+        "let h='<table class=fb><thead><tr><th>Name</th><th>Modified</th><th style=text-align:right>Size</th><th style=text-align:right>Actions</th></tr></thead><tbody>';"
+        "d.entries.sort((a,b)=>(b.dir-a.dir)||a.name.localeCompare(b.name)).forEach(en=>{const fp=d.dir+'/'+en.name;const nm=en.dir?('[dir] '+en.name):en.name;let a;"
+        "if(en.dir){a='<button class=lnk data-a=cd data-p=\"'+fp+'\">open</button>';}else{a='<a class=lnk href=\"/download?path='+encodeURIComponent(fp)+'\">get</a><button class=lnk data-a=ren data-p=\"'+fp+'\">ren</button><button class=lnk data-a=cp data-p=\"'+fp+'\">copy</button><button class=\"lnk danger\" data-a=del data-p=\"'+fp+'\">del</button>';}"
+        "h+='<tr><td'+(en.dir?' class=lnk data-a=cd data-p=\"'+fp+'\" style=cursor:pointer':'')+'>'+nm+'</td><td style=color:var(--muted)>'+(en.mtime||'')+'</td><td style=\"text-align:right;color:var(--muted)\">'+(en.dir?'':fbSize(en.size))+'</td><td style=\"text-align:right;white-space:nowrap\">'+a+'</td></tr>';});"
+        "h+='</tbody></table>';const L=document.getElementById('fbList');L.innerHTML=h;L.querySelectorAll('[data-a]').forEach(el=>{el.onclick=()=>fbAct(el.dataset.a,el.dataset.p);});}catch(e){}}"
+        "async function fbAct(a,fp){const nm=fp.substring(fp.lastIndexOf('/')+1),dir=fp.substring(0,fp.lastIndexOf('/'));"
+        "if(a==='cd'){fbLoad(fp);}"
+        "else if(a==='del'){if(confirm('Delete '+nm+'?')){await fetch('/delete?path='+encodeURIComponent(fp),{method:'POST'});fbLoad(fbCur);}}"
+        "else if(a==='ren'){const nn=prompt('Rename to:',nm);if(nn&&nn!==nm){await fetch('/rename?src='+encodeURIComponent(fp)+'&dst='+encodeURIComponent(dir+'/'+nn),{method:'POST'});fbLoad(fbCur);}}"
+        "else if(a==='cp'){const nn=prompt('Copy to name:','copy-'+nm);if(nn){await fetch('/copy?src='+encodeURIComponent(fp)+'&dst='+encodeURIComponent(dir+'/'+nn),{method:'POST'});fbLoad(fbCur);}}}"
         "document.getElementById('fbUp').onclick=()=>{if(fbCur!=='/sdcard')fbLoad(fbCur.substring(0,fbCur.lastIndexOf('/'))||'/sdcard');};"
         "document.getElementById('cfgBackup').onclick=async()=>{const st=document.getElementById('cfgState');st.textContent='Saving...';try{const r=await fetch('/config/backup',{method:'POST'});st.textContent=await r.text();fbLoad(fbCur);}catch(e){st.textContent='Backup failed';}};"
-        "async function wifiRefresh(){try{const d=await(await fetch('/wifi/list')).json();const l=document.getElementById('wifiList');l.innerHTML='';d.networks.forEach(ss=>{const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';const s=document.createElement('span');s.textContent=ss;r.appendChild(s);const del=document.createElement('button');del.className='btn danger';del.type='button';del.style.cssText='flex:0;min-width:60px;height:30px';del.textContent='Del';del.onclick=async()=>{await fetch('/wifi/del?ssid='+encodeURIComponent(ss),{method:'POST'});wifiRefresh();};r.appendChild(del);l.appendChild(r);});document.getElementById('wifiState').textContent=d.count+'/'+d.max+' networks'+(d.current?' - IP '+d.current:'');}catch(e){}}"
+        "async function wifiRefresh(){try{const d=await(await fetch('/wifi/list')).json();const l=document.getElementById('wifiList');l.innerHTML='';d.networks.forEach(ss=>{const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';const s=document.createElement('span');s.textContent=ss;r.appendChild(s);const del=document.createElement('button');del.className='btn danger';del.type='button';del.style.cssText='flex:0;min-width:60px;height:30px';del.textContent='Del';del.onclick=async()=>{await fetch('/wifi/del?ssid='+encodeURIComponent(ss),{method:'POST'});wifiRefresh();};r.appendChild(del);l.appendChild(r);});document.getElementById('wifiState').textContent=(d.ap?d.ap+' · '+d.rssi+' dBm · ch'+d.ch+' · '+d.phy:'not connected')+' · '+d.count+'/'+d.max+' saved'+(d.current?' · '+d.current:'');}catch(e){}}"
         "document.getElementById('wAdd').onclick=async()=>{const ss=document.getElementById('wSsid').value,pw=document.getElementById('wPass').value,st=document.getElementById('wifiState');if(!ss)return;const r=await fetch('/wifi/add?ssid='+encodeURIComponent(ss)+'&pass='+encodeURIComponent(pw),{method:'POST'});if(r.ok){document.getElementById('wSsid').value='';document.getElementById('wPass').value='';wifiRefresh();}else{st.textContent=await r.text();}};"
         "wifiRefresh();"
+        "function fmtB(n){return n>=1073741824?(n/1073741824).toFixed(1)+' GB':n>=1048576?(n/1048576).toFixed(1)+' MB':((n/1024)|0)+' KB';}"
+        "async function sysRefresh(){try{const d=await(await fetch('/sysinfo')).json();const up=d.uptime,uh=(up/3600|0),um=((up%3600)/60|0);"
+        "const rows=[['Chip',d.chip+' rev'+d.rev+', '+d.cores+' cores @ '+d.cpu_mhz+' MHz'],['Flash',d.flash_mb+' MB, ESP-IDF '+d.idf],['RAM free',fmtB(d.heap_free)+' / '+fmtB(d.heap_total)],['PSRAM free',fmtB(d.psram_free)+' / '+fmtB(d.psram_total)],['SD free',d.sd_total?fmtB(d.sd_free)+' / '+fmtB(d.sd_total):'no card'],['Uptime',uh+'h '+um+'m']];"
+        "document.getElementById('sysinfo').innerHTML=rows.map(r=>'<div><span>'+r[0]+'</span><b>'+r[1]+'</b></div>').join('');}catch(e){}}"
+        "setInterval(sysRefresh,5000);sysRefresh();"
         "async function timeRefresh(){try{const d=await(await fetch('/time')).json();document.getElementById('clock').textContent=d.time;document.getElementById('ntpState').textContent=d.ntp?(d.synced?'NTP synced':'NTP syncing...'):'NTP off (clips numbered)';document.getElementById('ntpOn').checked=d.ntp;var t=document.getElementById('tz');if(document.activeElement!==t)t.value=d.tz;}catch(e){}}"
         "document.getElementById('ntpOn').onchange=async e=>{await fetch('/ntp?on='+(e.target.checked?1:0),{method:'POST'});setTimeout(timeRefresh,600);};"
-        "document.getElementById('tzSave').onclick=async()=>{await fetch('/ntp?tz='+encodeURIComponent(document.getElementById('tz').value),{method:'POST'});setTimeout(timeRefresh,600);};"
+        "document.getElementById('tz').onchange=async e=>{await fetch('/ntp?tz='+encodeURIComponent(e.target.value),{method:'POST'});setTimeout(timeRefresh,600);};"
         "setInterval(timeRefresh,2000);timeRefresh();"
         "fbLoad('/sdcard');"
         "</script></body></html>");
@@ -1853,6 +1992,9 @@ static httpd_uri_t uri_wifi_add   = { .uri = "/wifi/add",  .method = HTTP_POST, 
 static httpd_uri_t uri_wifi_del   = { .uri = "/wifi/del",  .method = HTTP_POST, .handler = wifi_del_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_time       = { .uri = "/time",      .method = HTTP_GET,  .handler = time_handler,     .user_ctx = NULL };
 static httpd_uri_t uri_ntp        = { .uri = "/ntp",       .method = HTTP_POST, .handler = ntp_handler,      .user_ctx = NULL };
+static httpd_uri_t uri_rename     = { .uri = "/rename",    .method = HTTP_POST, .handler = rename_handler,   .user_ctx = NULL };
+static httpd_uri_t uri_copy       = { .uri = "/copy",      .method = HTTP_POST, .handler = copy_handler,     .user_ctx = NULL };
+static httpd_uri_t uri_sysinfo    = { .uri = "/sysinfo",   .method = HTTP_GET,  .handler = sysinfo_handler,  .user_ctx = NULL };
 
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -1886,6 +2028,9 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_wifi_del);
         httpd_register_uri_handler(server, &uri_time);
         httpd_register_uri_handler(server, &uri_ntp);
+        httpd_register_uri_handler(server, &uri_rename);
+        httpd_register_uri_handler(server, &uri_copy);
+        httpd_register_uri_handler(server, &uri_sysinfo);
         ESP_LOGI(TAG, "HTTP server started");
     }
     return server;
