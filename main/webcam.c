@@ -56,6 +56,9 @@ static esp_err_t init_mic(void);
 static esp_err_t audio_handler(httpd_req_t *req);
 static esp_err_t ota_handler(httpd_req_t *req);
 static esp_err_t config_backup_handler(httpd_req_t *req);
+static esp_err_t wifi_list_handler(httpd_req_t *req);
+static esp_err_t wifi_add_handler(httpd_req_t *req);
+static esp_err_t wifi_del_handler(httpd_req_t *req);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
@@ -66,8 +69,6 @@ static esp_err_t init_sd_card(void);
 static esp_err_t mount_sd_card(bool format_if_mount_failed);
 static void wifi_init_sta(void);
 static void wifi_init_prov(void);
-static esp_err_t wifi_credentials_load(char *ssid, size_t ssid_len, char *pass, size_t pass_len);
-static esp_err_t wifi_credentials_save(const char *ssid, const char *pass);
 static httpd_handle_t start_webserver(void);
 static httpd_handle_t start_stream_webserver(void);
 static httpd_handle_t start_prov_webserver(void);
@@ -132,6 +133,13 @@ static EventGroupHandle_t wifi_event_group;
 static int wifi_retry_count;
 static bool wifi_got_ip_once;
 static char device_ip[16] = "";
+
+/* Known-networks list (main + repeaters/guest/etc.) — connect to whichever is up. */
+#define WIFI_MAX_CREDS 5
+typedef struct { char ssid[33]; char pass[64]; } wifi_cred_t;
+static wifi_cred_t wifi_creds[WIFI_MAX_CREDS];
+static int wifi_cred_count;
+static volatile bool wifi_selecting;   /* true while trying candidates at boot */
 static wifi_ap_record_t scan_results[MAX_SCAN_RESULTS];
 static uint16_t scan_result_count;
 static bool camera_ready;
@@ -187,46 +195,73 @@ static camera_config_t camera_config = {
     .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
 
-/* NVS WiFi Credentials */
-static esp_err_t wifi_credentials_load(char *ssid, size_t ssid_len, char *pass, size_t pass_len) {
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) return err;
-    err = nvs_get_str(handle, NVS_WIFI_SSID_KEY, ssid, &ssid_len);
-    if (err == ESP_OK) {
-        err = nvs_get_str(handle, NVS_WIFI_PASS_KEY, pass, &pass_len);
+/* ---- Known-networks list (main + repeaters/guest/...) ---- */
+static void wifi_creds_save_all(void) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, "n", wifi_cred_count);
+    for (int i = 0; i < wifi_cred_count; i++) {
+        char ks[12], kp[12];
+        snprintf(ks, sizeof(ks), "s%d", i);
+        snprintf(kp, sizeof(kp), "p%d", i);
+        nvs_set_str(h, ks, wifi_creds[i].ssid);
+        nvs_set_str(h, kp, wifi_creds[i].pass);
     }
-    nvs_close(handle);
-    if (err == ESP_OK) {
-        if (strlen(ssid) == 0 || !wifi_password_is_valid(pass)) {
-            ESP_LOGW(TAG, "Ignoring invalid WiFi credentials in NVS");
-            return ESP_ERR_INVALID_STATE;
-        }
-
-        for (size_t i = 0; ssid[i]; i++) {
-            unsigned char c = (unsigned char)ssid[i];
-            if (c < 0x20 || c == 0x7f) {
-                ESP_LOGW(TAG, "Ignoring invalid SSID in NVS");
-                return ESP_ERR_INVALID_STATE;
-            }
-        }
-    }
-    return err;
+    nvs_commit(h);
+    nvs_close(h);
 }
 
-static esp_err_t wifi_credentials_save(const char *ssid, const char *pass) {
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) return err;
-    err = nvs_set_str(handle, NVS_WIFI_SSID_KEY, ssid);
-    if (err == ESP_OK) err = nvs_set_str(handle, NVS_WIFI_PASS_KEY, pass);
-    if (err == ESP_OK) err = nvs_commit(handle);
-    nvs_close(handle);
-    return err;
+static void wifi_creds_add(const char *ssid, const char *pass) {
+    if (!ssid || !ssid[0]) return;
+    for (int i = 0; i < wifi_cred_count; i++) {
+        if (strcmp(wifi_creds[i].ssid, ssid) == 0) {            /* update existing */
+            strlcpy(wifi_creds[i].pass, pass ? pass : "", sizeof(wifi_creds[i].pass));
+            wifi_creds_save_all();
+            return;
+        }
+    }
+    if (wifi_cred_count >= WIFI_MAX_CREDS) {                    /* full: drop oldest */
+        memmove(&wifi_creds[0], &wifi_creds[1], (WIFI_MAX_CREDS - 1) * sizeof(wifi_cred_t));
+        wifi_cred_count = WIFI_MAX_CREDS - 1;
+    }
+    strlcpy(wifi_creds[wifi_cred_count].ssid, ssid, sizeof(wifi_creds[0].ssid));
+    strlcpy(wifi_creds[wifi_cred_count].pass, pass ? pass : "", sizeof(wifi_creds[0].pass));
+    wifi_cred_count++;
+    wifi_creds_save_all();
 }
 
-/* Write a portable config (incl. WiFi creds) to the SD card. */
-static void sd_config_save(const char *ssid, const char *pass) {
+static void wifi_creds_load(void) {
+    wifi_cred_count = 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+    int32_t n = 0;
+    nvs_get_i32(h, "n", &n);
+    for (int i = 0; i < n && wifi_cred_count < WIFI_MAX_CREDS; i++) {
+        char ks[12], kp[12];
+        snprintf(ks, sizeof(ks), "s%d", i);
+        snprintf(kp, sizeof(kp), "p%d", i);
+        size_t sl = sizeof(wifi_creds[wifi_cred_count].ssid);
+        if (nvs_get_str(h, ks, wifi_creds[wifi_cred_count].ssid, &sl) != ESP_OK) continue;
+        size_t pl = sizeof(wifi_creds[wifi_cred_count].pass);
+        if (nvs_get_str(h, kp, wifi_creds[wifi_cred_count].pass, &pl) != ESP_OK)
+            wifi_creds[wifi_cred_count].pass[0] = '\0';
+        if (wifi_creds[wifi_cred_count].ssid[0]) wifi_cred_count++;
+    }
+    if (wifi_cred_count == 0) {   /* migrate a legacy single credential */
+        char ssid[33] = {0}, pass[64] = {0};
+        size_t sl = sizeof(ssid), pl = sizeof(pass);
+        if (nvs_get_str(h, NVS_WIFI_SSID_KEY, ssid, &sl) == ESP_OK && ssid[0]) {
+            if (nvs_get_str(h, NVS_WIFI_PASS_KEY, pass, &pl) != ESP_OK) pass[0] = '\0';
+            strlcpy(wifi_creds[0].ssid, ssid, sizeof(wifi_creds[0].ssid));
+            strlcpy(wifi_creds[0].pass, pass, sizeof(wifi_creds[0].pass));
+            wifi_cred_count = 1;
+        }
+    }
+    nvs_close(h);
+}
+
+/* Write the full config (all known networks) to the SD card. */
+static void sd_config_save_all(void) {
     if (!sd_ready) return;
     FILE *f = fopen(SD_CONFIG_PATH, "w");
     if (!f) {
@@ -234,23 +269,25 @@ static void sd_config_save(const char *ssid, const char *pass) {
         return;
     }
     fprintf(f, "# XIAO ESP32S3 camera config\n");
-    fprintf(f, "# Drop this SD card into a fresh board to auto-provision WiFi.\n");
-    fprintf(f, "ssid=%s\n", ssid);
-    fprintf(f, "pass=%s\n", pass);
+    fprintf(f, "# Repeat ssid/pass for each known network (main, repeaters, ...).\n");
+    fprintf(f, "# Drop this SD card into a fresh board to auto-provision.\n");
+    for (int i = 0; i < wifi_cred_count; i++) {
+        fprintf(f, "ssid=%s\n", wifi_creds[i].ssid);
+        fprintf(f, "pass=%s\n", wifi_creds[i].pass);
+    }
     fprintf(f, "rec_pct=%d\n", rec_budget_pct);
     fprintf(f, "rec_audio=%d\n", rec_audio ? 1 : 0);
     fclose(f);
-    ESP_LOGI(TAG, "Config written to %s", SD_CONFIG_PATH);
+    ESP_LOGI(TAG, "Config written to %s (%d networks)", SD_CONFIG_PATH, wifi_cred_count);
 }
 
-/* Read config from SD. Returns true if a usable SSID was found; also applies
-   any recording settings present. */
-static bool sd_config_load(char *ssid, size_t sl, char *pass, size_t pl) {
+/* Merge known networks from the SD config into the list. Returns true if any
+   credential was added. Also applies recording settings if present. */
+static bool sd_config_load(void) {
     FILE *f = fopen(SD_CONFIG_PATH, "r");
     if (!f) return false;
-    ssid[0] = '\0';
-    pass[0] = '\0';
-    char line[160];
+    char line[160], cur_ssid[33] = "";
+    bool added = false;
     while (fgets(line, sizeof(line), f)) {
         char *nl = strpbrk(line, "\r\n");
         if (nl) *nl = '\0';
@@ -259,13 +296,18 @@ static bool sd_config_load(char *ssid, size_t sl, char *pass, size_t pl) {
         if (!eq) continue;
         *eq = '\0';
         const char *k = line, *v = eq + 1;
-        if (strcmp(k, "ssid") == 0)            strlcpy(ssid, v, sl);
-        else if (strcmp(k, "pass") == 0)       strlcpy(pass, v, pl);
-        else if (strcmp(k, "rec_pct") == 0)    { int p = atoi(v); if (p >= 10 && p <= 95) rec_budget_pct = p; }
-        else if (strcmp(k, "rec_audio") == 0)  rec_audio = atoi(v) ? true : false;
+        if (strcmp(k, "ssid") == 0) {
+            if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }  /* prev open net */
+            strlcpy(cur_ssid, v, sizeof(cur_ssid));
+        } else if (strcmp(k, "pass") == 0) {
+            if (cur_ssid[0] && wifi_password_is_valid(v)) { wifi_creds_add(cur_ssid, v); added = true; }
+            cur_ssid[0] = '\0';
+        } else if (strcmp(k, "rec_pct") == 0)   { int p = atoi(v); if (p >= 10 && p <= 95) rec_budget_pct = p; }
+        else if (strcmp(k, "rec_audio") == 0)   rec_audio = atoi(v) ? true : false;
     }
+    if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }
     fclose(f);
-    return strlen(ssid) > 0 && wifi_password_is_valid(pass);
+    return added;
 }
 
 /* Persist one camera setting (framesize, hmirror, vflip, ...) to NVS. */
@@ -896,14 +938,64 @@ static esp_err_t delete_handler(httpd_req_t *req) {
 /* Back up the current config (incl. WiFi creds from NVS) to the SD card. */
 static esp_err_t config_backup_handler(httpd_req_t *req) {
     if (!sd_ready) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No SD card mounted"); return ESP_FAIL; }
-    char ssid[32] = {0}, pass[64] = {0};
-    if (wifi_credentials_load(ssid, sizeof(ssid), pass, sizeof(pass)) != ESP_OK || !ssid[0]) {
+    if (wifi_cred_count == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No saved WiFi to back up");
         return ESP_FAIL;
     }
-    sd_config_save(ssid, pass);
+    sd_config_save_all();
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_sendstr(req, "Config saved to " SD_CONFIG_PATH);
+}
+
+static esp_err_t wifi_list_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "{\"networks\":[");
+    for (int i = 0; i < wifi_cred_count; i++) {
+        char esc[64], item[80];
+        json_escape_string(esc, sizeof(esc), wifi_creds[i].ssid);
+        snprintf(item, sizeof(item), "%s\"%s\"", i ? "," : "", esc);
+        httpd_resp_sendstr_chunk(req, item);
+    }
+    char tail[80];
+    snprintf(tail, sizeof(tail), "],\"count\":%d,\"max\":%d,\"current\":\"%s\"}",
+             wifi_cred_count, WIFI_MAX_CREDS, device_ip[0] ? device_ip : "");
+    httpd_resp_sendstr_chunk(req, tail);
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+static esp_err_t wifi_add_handler(httpd_req_t *req) {
+    char q[256], ssid[33] = "", pass[64] = "", v[160];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "ssid", v, sizeof(v)) == ESP_OK) url_decode(ssid, v, sizeof(ssid));
+        if (httpd_query_key_value(q, "pass", v, sizeof(v)) == ESP_OK) url_decode(pass, v, sizeof(pass));
+    }
+    if (!ssid[0] || !wifi_password_is_valid(pass)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID required; password empty or 8-63 chars");
+        return ESP_FAIL;
+    }
+    wifi_creds_add(ssid, pass);
+    sd_config_save_all();
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t wifi_del_handler(httpd_req_t *req) {
+    char q[128], ssid[33] = "", v[96];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "ssid", v, sizeof(v)) == ESP_OK) {
+        url_decode(ssid, v, sizeof(ssid));
+    }
+    for (int i = 0; i < wifi_cred_count; i++) {
+        if (strcmp(wifi_creds[i].ssid, ssid) == 0) {
+            memmove(&wifi_creds[i], &wifi_creds[i + 1], (wifi_cred_count - i - 1) * sizeof(wifi_cred_t));
+            wifi_cred_count--;
+            wifi_creds_save_all();
+            sd_config_save_all();
+            break;
+        }
+    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
 static esp_err_t init_sd_card(void) {
@@ -947,23 +1039,20 @@ static esp_err_t mount_sd_card(bool format_if_mount_failed) {
 static void wifi_event_handler_sta(void *arg, esp_event_base_t event_base,
                                     int32_t event_id, void *event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (!wifi_selecting) esp_wifi_connect();   /* during selection we connect manually */
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
-        if (wifi_got_ip_once) {
+        if (wifi_selecting) {
+            /* Candidate attempt failed; let wifi_connect_best() move to the next. */
+            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+        } else if (wifi_got_ip_once) {
             /* An established link dropped (e.g. router reboot / signal loss):
                reconnect forever with a short backoff so the board self-heals. */
             ESP_LOGW(TAG, "WiFi lost, reconnecting...");
             vTaskDelay(pdMS_TO_TICKS(2000));
             esp_wifi_connect();
-        } else if (wifi_retry_count < WIFI_MAXIMUM_RETRY) {
-            wifi_retry_count++;
-            ESP_LOGI(TAG, "WiFi disconnected, retrying (%d/%d)...",
-                     wifi_retry_count, WIFI_MAXIMUM_RETRY);
-            esp_wifi_connect();
         } else {
-            ESP_LOGW(TAG, "WiFi connection failed, switching to provisioning mode");
-            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+            esp_wifi_connect();
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
@@ -986,21 +1075,65 @@ static void wifi_event_handler_ap(void *arg, esp_event_base_t event_base,
     }
 }
 
-static void wifi_init_sta(void) {
-    char ssid[32] = {0};
-    char pass[64] = {0};
+/* Scan, then try known networks present on air (best RSSI first). One attempt
+   per candidate; returns true as soon as one gets an IP. */
+static bool wifi_connect_best(void) {
+    scan_wifi_networks();   /* fills scan_results / scan_result_count */
 
-    if (wifi_credentials_load(ssid, sizeof(ssid), pass, sizeof(pass)) != ESP_OK || strlen(ssid) == 0) {
-        /* Before provisioning, try a config file on the SD card (drop-in setup). */
-        if (sd_config_load(ssid, sizeof(ssid), pass, sizeof(pass))) {
-            ESP_LOGI(TAG, "Loaded WiFi credentials from SD (%s); persisting to NVS", SD_CONFIG_PATH);
-            wifi_credentials_save(ssid, pass);
-        } else {
-            ESP_LOGW(TAG, "No WiFi credentials in NVS or SD, starting provisioning mode");
-            wifi_init_prov();
-            return;
+    int order[WIFI_MAX_CREDS], rssi[WIFI_MAX_CREDS], nc = 0;
+    for (int i = 0; i < wifi_cred_count; i++) {
+        int best = -128; bool present = false;
+        for (int j = 0; j < scan_result_count; j++) {
+            if (strcmp(wifi_creds[i].ssid, (const char *)scan_results[j].ssid) == 0) {
+                present = true;
+                if (scan_results[j].rssi > best) best = scan_results[j].rssi;
+            }
         }
+        if (present) { order[nc] = i; rssi[nc] = best; nc++; }
     }
+    for (int a = 0; a < nc; a++)          /* sort candidates by RSSI desc */
+        for (int b = a + 1; b < nc; b++)
+            if (rssi[b] > rssi[a]) {
+                int t = order[a]; order[a] = order[b]; order[b] = t;
+                t = rssi[a]; rssi[a] = rssi[b]; rssi[b] = t;
+            }
+
+    int tries = nc > 0 ? nc : wifi_cred_count;   /* if none seen (hidden SSID), still try all */
+    for (int k = 0; k < tries; k++) {
+        int i = nc > 0 ? order[k] : k;
+        wifi_config_t wc = {0};
+        strlcpy((char *)wc.sta.ssid, wifi_creds[i].ssid, sizeof(wc.sta.ssid));
+        strlcpy((char *)wc.sta.password, wifi_creds[i].pass, sizeof(wc.sta.password));
+        wc.sta.threshold.authmode = strlen(wifi_creds[i].pass) > 0 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+        wc.sta.pmf_cfg.capable = true;
+        esp_wifi_set_config(WIFI_IF_STA, &wc);
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        ESP_LOGI(TAG, "Trying WiFi '%s'%s...", wifi_creds[i].ssid,
+                 nc > 0 ? " (in range)" : "");
+        esp_wifi_connect();
+        EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(12000));
+        if (bits & WIFI_CONNECTED_BIT) {
+            ESP_LOGI(TAG, "Connected to '%s'", wifi_creds[i].ssid);
+            return true;
+        }
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    return false;
+}
+
+static void wifi_init_sta(void) {
+    wifi_creds_load();               /* known networks from NVS */
+    if (sd_config_load()) {          /* merge any networks + settings from the SD card */
+        ESP_LOGI(TAG, "Merged known networks from SD (%s)", SD_CONFIG_PATH);
+    }
+    if (wifi_cred_count == 0) {
+        ESP_LOGW(TAG, "No known WiFi networks in NVS or SD, starting provisioning mode");
+        wifi_init_prov();
+        return;
+    }
+    ESP_LOGI(TAG, "%d known WiFi network(s) configured", wifi_cred_count);
 
     wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
@@ -1013,39 +1146,21 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler_sta, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler_sta, NULL));
 
-    wifi_config_t wifi_config = {0};
-    strlcpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
-    strlcpy((char *)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode = strlen(pass) > 0 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    wifi_config.sta.pmf_cfg.capable = true;
-    wifi_config.sta.pmf_cfg.required = false;
-    ESP_LOGI(TAG, "Loaded WiFi credentials for SSID: %s", ssid);
-
+    wifi_selecting = true;
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     /* Always-on camera on mains power: disable modem sleep. v6.0 defaults to
        WIFI_PS_MIN_MODEM, which adds latency and packet loss for a server role. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    ESP_LOGI(TAG, "WiFi STA started, connecting to %s...", ssid);
-    EventBits_t bits = xEventGroupWaitBits(
-        wifi_event_group,
-        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdFALSE,
-        pdFALSE,
-        pdMS_TO_TICKS(30000));
 
-    if (bits & WIFI_CONNECTED_BIT) {
-        return;
+    bool connected = wifi_connect_best();
+    wifi_selecting = false;
+    if (connected) {
+        return;   /* event handler now keeps the link alive (reconnects forever) */
     }
-
-    ESP_LOGW(TAG, "STA connection timed out or failed, starting provisioning mode");
-    ESP_ERROR_CHECK(esp_wifi_stop());
+    ESP_LOGW(TAG, "No known network reachable; starting provisioning AP");
     ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler_sta));
     ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler_sta));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
     scan_wifi_networks();
     ESP_ERROR_CHECK(esp_wifi_stop());
 
@@ -1471,6 +1586,15 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
         "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
         "</section>"
+        "<section class='card'><h3>WiFi networks</h3>"
+        "<div id='wifiList' style='display:flex;flex-direction:column;gap:6px;margin-bottom:10px'></div>"
+        "<div class='toolbar' style='margin:0 0 8px'>"
+        "<input id='wSsid' placeholder='SSID' style='flex:1;min-width:110px;height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:0 10px'>"
+        "<input id='wPass' type='password' placeholder='Password' style='flex:1;min-width:110px;height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:0 10px'>"
+        "<button class='btn primary' id='wAdd' type='button'>Add</button>"
+        "</div>"
+        "<div class='meta'><span id='wifiState'>The board connects to the strongest known network on boot.</span></div>"
+        "</section>"
         "<section class='card'><h3>SD Files</h3>"
         "<div class='toolbar' style='margin:0 0 10px'><button class='btn' id='cfgBackup' type='button'>Backup config to SD</button></div>"
         "<div class='meta' style='margin:0 0 10px'><span id='cfgState'>Config (incl. WiFi) can be saved to SD and auto-loaded on a fresh board.</span></div>"
@@ -1517,6 +1641,9 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "async function fbLoad(p){try{const r=await fetch('/files?dir='+encodeURIComponent(p));if(!r.ok)return;const d=await r.json();fbCur=d.dir;document.getElementById('fbPath').textContent=d.dir;const l=document.getElementById('fbList');l.innerHTML='';d.entries.sort((a,b)=>(b.dir-a.dir)||a.name.localeCompare(b.name)).forEach(en=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';const s=document.createElement('span');s.textContent=(en.dir?'[dir] ':'')+en.name+(en.dir?'':' ('+((en.size/1024)|0)+' KB)');if(en.dir){s.style.cursor='pointer';s.onclick=()=>fbLoad(d.dir+'/'+en.name);}row.appendChild(s);if(!en.dir){const w=document.createElement('span');const g=document.createElement('a');g.className='btn';g.style.cssText='flex:0;min-width:70px;height:30px';g.textContent='Get';g.href='/download?path='+encodeURIComponent(d.dir+'/'+en.name);const del=document.createElement('button');del.className='btn danger';del.type='button';del.style.cssText='flex:0;min-width:64px;height:30px;margin-left:6px';del.textContent='Del';del.onclick=async()=>{if(confirm('Delete '+en.name+'?')){await fetch('/delete?path='+encodeURIComponent(d.dir+'/'+en.name),{method:'POST'});fbLoad(fbCur);}};w.appendChild(g);w.appendChild(del);row.appendChild(w);}l.appendChild(row);});}catch(e){}}"
         "document.getElementById('fbUp').onclick=()=>{if(fbCur!=='/sdcard')fbLoad(fbCur.substring(0,fbCur.lastIndexOf('/'))||'/sdcard');};"
         "document.getElementById('cfgBackup').onclick=async()=>{const st=document.getElementById('cfgState');st.textContent='Saving...';try{const r=await fetch('/config/backup',{method:'POST'});st.textContent=await r.text();fbLoad(fbCur);}catch(e){st.textContent='Backup failed';}};"
+        "async function wifiRefresh(){try{const d=await(await fetch('/wifi/list')).json();const l=document.getElementById('wifiList');l.innerHTML='';d.networks.forEach(ss=>{const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';const s=document.createElement('span');s.textContent=ss;r.appendChild(s);const del=document.createElement('button');del.className='btn danger';del.type='button';del.style.cssText='flex:0;min-width:60px;height:30px';del.textContent='Del';del.onclick=async()=>{await fetch('/wifi/del?ssid='+encodeURIComponent(ss),{method:'POST'});wifiRefresh();};r.appendChild(del);l.appendChild(r);});document.getElementById('wifiState').textContent=d.count+'/'+d.max+' networks'+(d.current?' - IP '+d.current:'');}catch(e){}}"
+        "document.getElementById('wAdd').onclick=async()=>{const ss=document.getElementById('wSsid').value,pw=document.getElementById('wPass').value,st=document.getElementById('wifiState');if(!ss)return;const r=await fetch('/wifi/add?ssid='+encodeURIComponent(ss)+'&pass='+encodeURIComponent(pw),{method:'POST'});if(r.ok){document.getElementById('wSsid').value='';document.getElementById('wPass').value='';wifiRefresh();}else{st.textContent=await r.text();}};"
+        "wifiRefresh();"
         "fbLoad('/sdcard');"
         "</script></body></html>");
     return httpd_resp_sendstr_chunk(req, NULL);
@@ -1577,6 +1704,9 @@ static httpd_uri_t uri_files      = { .uri = "/files",     .method = HTTP_GET,  
 static httpd_uri_t uri_download   = { .uri = "/download",  .method = HTTP_GET,  .handler = download_handler,   .user_ctx = NULL };
 static httpd_uri_t uri_delete     = { .uri = "/delete",    .method = HTTP_POST, .handler = delete_handler,     .user_ctx = NULL };
 static httpd_uri_t uri_cfg_backup = { .uri = "/config/backup", .method = HTTP_POST, .handler = config_backup_handler, .user_ctx = NULL };
+static httpd_uri_t uri_wifi_list  = { .uri = "/wifi/list", .method = HTTP_GET,  .handler = wifi_list_handler, .user_ctx = NULL };
+static httpd_uri_t uri_wifi_add   = { .uri = "/wifi/add",  .method = HTTP_POST, .handler = wifi_add_handler,  .user_ctx = NULL };
+static httpd_uri_t uri_wifi_del   = { .uri = "/wifi/del",  .method = HTTP_POST, .handler = wifi_del_handler,  .user_ctx = NULL };
 
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -1605,6 +1735,9 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_download);
         httpd_register_uri_handler(server, &uri_delete);
         httpd_register_uri_handler(server, &uri_cfg_backup);
+        httpd_register_uri_handler(server, &uri_wifi_list);
+        httpd_register_uri_handler(server, &uri_wifi_add);
+        httpd_register_uri_handler(server, &uri_wifi_del);
         ESP_LOGI(TAG, "HTTP server started");
     }
     return server;
@@ -1831,13 +1964,9 @@ static esp_err_t prov_save_handler(httpd_req_t *req) {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Saving WiFi: SSID=%s", ssid);
-    esp_err_t err = wifi_credentials_save(ssid, pass);
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS save failed");
-        return ESP_FAIL;
-    }
-    sd_config_save(ssid, pass);   /* mirror to SD so the config is portable */
+    ESP_LOGI(TAG, "Saving WiFi network: SSID=%s", ssid);
+    wifi_creds_add(ssid, pass);   /* add to the known-networks list (NVS) */
+    sd_config_save_all();         /* mirror the whole list to SD */
 
     const char *resp = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
                        "<title>Saved</title></head><body style='font-family:sans-serif;"
