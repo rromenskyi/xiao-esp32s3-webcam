@@ -556,6 +556,7 @@ static void rec_cfg_load(void) {
     int32_t v;
     if (nvs_get_i32(h, "pct", &v) == ESP_OK && v >= 10 && v <= 95) rec_budget_pct = v;
     if (nvs_get_i32(h, "audio", &v) == ESP_OK) rec_audio = v ? true : false;
+    if (nvs_get_i32(h, "on", &v) == ESP_OK) rec_enabled = v ? true : false;  /* auto-resume loop after power-up */
     nvs_close(h);
 }
 static void rec_cfg_save(void) {
@@ -563,6 +564,7 @@ static void rec_cfg_save(void) {
     if (nvs_open(REC_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_i32(h, "pct", rec_budget_pct);
     nvs_set_i32(h, "audio", rec_audio ? 1 : 0);
+    nvs_set_i32(h, "on", rec_enabled ? 1 : 0);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -778,7 +780,7 @@ static void rec_task(void *arg) {
 static esp_err_t rec_toggle_handler(httpd_req_t *req) {
     char q[64], v[16];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
-        if (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK) rec_enabled = atoi(v) ? true : false;
+        if (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK) { rec_enabled = atoi(v) ? true : false; rec_cfg_save(); }
         if (httpd_query_key_value(q, "pct", v, sizeof(v)) == ESP_OK) { int p = atoi(v); if (p >= 10 && p <= 95) { rec_budget_pct = p; rec_cfg_save(); } }
         if (httpd_query_key_value(q, "audio", v, sizeof(v)) == ESP_OK) { rec_audio = atoi(v) ? true : false; rec_cfg_save(); }
     }
