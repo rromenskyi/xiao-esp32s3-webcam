@@ -937,14 +937,19 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
     /* Firmware / OTA card */
     const esp_app_desc_t *app = esp_app_get_description();
-    char fw_line[160], fw_html[sizeof(fw_line) * 6 + 1];
-    snprintf(fw_line, sizeof(fw_line), "%s · %s · built %s %s",
+    char fw_line[128], tools_line[160];
+    char fw_html[sizeof(fw_line) * 6 + 1], tools_html[sizeof(tools_line) * 6 + 1];
+    snprintf(fw_line, sizeof(fw_line), "%s %s (built %s %s)",
              app->project_name, app->version, app->date, app->time);
+    snprintf(tools_line, sizeof(tools_line), "ESP-IDF %s · GCC %s", app->idf_ver, __VERSION__);
     html_escape_string(fw_html, sizeof(fw_html), fw_line);
+    html_escape_string(tools_html, sizeof(tools_html), tools_line);
     httpd_resp_sendstr_chunk(req,
         "<section class='card'><h3>Firmware</h3>"
-        "<div class='meta' style='margin:0 0 12px'><span>Running: ");
+        "<div class='meta' style='margin:0 0 4px'><span>Running: ");
     httpd_resp_sendstr_chunk(req, fw_html);
+    httpd_resp_sendstr_chunk(req, "</span></div><div class='meta' style='margin:0 0 12px'><span>Built with: ");
+    httpd_resp_sendstr_chunk(req, tools_html);
     httpd_resp_sendstr_chunk(req,
         "</span></div>"
         "<div class='toolbar' style='margin:0 0 10px'>"
