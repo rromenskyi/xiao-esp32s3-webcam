@@ -22,6 +22,9 @@ air — no USB needed after the first flash.
 - **Onboard PDM microphone** — `/audio.wav` records mono 16 kHz PCM with a
   DC-block filter and gain.
 - **microSD card** (SDMMC 1-bit) with a format action from the UI.
+- **BLE remote/info** — advertises as `XIAO-CAM` with a Nordic-UART-style GATT
+  service; read status (IP / firmware / recording) and send `rec on` / `rec off`
+  from a phone (e.g. nRF Connect), even without knowing the IP.
 
 ## Hardware
 

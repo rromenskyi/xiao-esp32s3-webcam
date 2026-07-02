@@ -26,6 +26,10 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 # LWIP: extra sockets for concurrent MJPEG viewers + two http servers + mDNS
 CONFIG_LWIP_MAX_SOCKETS=20
 
+# Bluetooth LE (NimBLE) for the BLE remote/info service, coexisting with WiFi
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
 # HTTP Server
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=2048
 CONFIG_HTTPD_MAX_URI_LEN=2048

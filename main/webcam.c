@@ -28,6 +28,12 @@
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "mdns.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -125,6 +131,7 @@ static EventGroupHandle_t wifi_event_group;
 
 static int wifi_retry_count;
 static bool wifi_got_ip_once;
+static char device_ip[16] = "";
 static wifi_ap_record_t scan_results[MAX_SCAN_RESULTS];
 static uint16_t scan_result_count;
 static bool camera_ready;
@@ -959,6 +966,7 @@ static void wifi_event_handler_sta(void *arg, esp_event_base_t event_base,
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        snprintf(device_ip, sizeof(device_ip), IPSTR, IP2STR(&event->ip_info.ip));
         wifi_retry_count = 0;
         wifi_got_ip_once = true;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
@@ -2033,6 +2041,103 @@ static void url_decode(char *dst, const char *src, size_t dst_size) {
     dst[j] = '\0';
 }
 
+/* ============================ BLE remote / info (NimBLE) ============================
+ * Advertises as "XIAO-CAM" with a Nordic-UART-style GATT service so a phone
+ * (e.g. nRF Connect) can read status (IP / version / recording) and send
+ * commands ("rec on" / "rec off") — works even without knowing the IP. */
+static uint8_t ble_addr_type;
+static void ble_advertise(void);
+
+/* NUS UUIDs: service 6e400001-, RX(write) ...0002, TX/status(read+notify) ...0003 */
+static const ble_uuid128_t ble_svc_uuid =
+    BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,0x93,0xf3,0xa3,0xb5,0x01,0x00,0x40,0x6e);
+static const ble_uuid128_t ble_cmd_uuid =
+    BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,0x93,0xf3,0xa3,0xb5,0x02,0x00,0x40,0x6e);
+static const ble_uuid128_t ble_status_uuid =
+    BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,0x93,0xf3,0xa3,0xb5,0x03,0x00,0x40,0x6e);
+
+static int ble_status_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    const esp_app_desc_t *app = esp_app_get_description();
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "ip=%s ver=%s cam=%s rec=%s",
+                     device_ip[0] ? device_ip : "-", app->version,
+                     camera_ready ? "on" : "off", rec_enabled ? "on" : "off");
+    return os_mbuf_append(ctxt->om, buf, n) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static int ble_cmd_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    char cmd[32] = {0};
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    if (len >= sizeof(cmd)) len = sizeof(cmd) - 1;
+    ble_hs_mbuf_to_flat(ctxt->om, cmd, len, NULL);
+    if (strncmp(cmd, "rec on", 6) == 0 || strncmp(cmd, "rec 1", 5) == 0) rec_enabled = true;
+    else if (strncmp(cmd, "rec off", 7) == 0 || strncmp(cmd, "rec 0", 5) == 0) rec_enabled = false;
+    ESP_LOGI(TAG, "BLE command: '%s'", cmd);
+    return 0;
+}
+
+static const struct ble_gatt_svc_def ble_gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &ble_svc_uuid.u,
+        .characteristics = (struct ble_gatt_chr_def[]){
+            { .uuid = &ble_status_uuid.u, .access_cb = ble_status_access, .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY },
+            { .uuid = &ble_cmd_uuid.u,    .access_cb = ble_cmd_access,    .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP },
+            { 0 },
+        },
+    },
+    { 0 },
+};
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg) {
+    if (event->type == BLE_GAP_EVENT_CONNECT) {
+        if (event->connect.status != 0) ble_advertise();
+    } else if (event->type == BLE_GAP_EVENT_DISCONNECT) {
+        ble_advertise();
+    } else if (event->type == BLE_GAP_EVENT_ADV_COMPLETE) {
+        ble_advertise();
+    }
+    return 0;
+}
+
+static void ble_advertise(void) {
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (uint8_t *)"XIAO-CAM";
+    fields.name_len = 8;
+    fields.name_is_complete = 1;
+    ble_gap_adv_set_fields(&fields);
+    struct ble_gap_adv_params advp = {0};
+    advp.conn_mode = BLE_GAP_CONN_MODE_UND;
+    advp.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    ble_gap_adv_start(ble_addr_type, NULL, BLE_HS_FOREVER, &advp, ble_gap_event, NULL);
+}
+
+static void ble_on_sync(void) {
+    ble_hs_id_infer_auto(0, &ble_addr_type);
+    ble_advertise();
+    ESP_LOGI(TAG, "BLE advertising as XIAO-CAM");
+}
+
+static void ble_host_task(void *param) {
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+static void ble_init(void) {
+    if (nimble_port_init() != ESP_OK) {
+        ESP_LOGW(TAG, "NimBLE init failed");
+        return;
+    }
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_gatts_count_cfg(ble_gatt_svcs);
+    ble_gatts_add_svcs(ble_gatt_svcs);
+    ble_svc_gap_device_name_set("XIAO-CAM");
+    ble_hs_cfg.sync_cb = ble_on_sync;
+    nimble_port_freertos_init(ble_host_task);
+}
+
 void app_main(void) {
     ESP_LOGI(TAG, "Starting XIAO ESP32S3 Sense Webcam");
     esp_err_t ret = nvs_flash_init();
@@ -2069,4 +2174,5 @@ void app_main(void) {
     start_stream_webserver();
     /* Loop recorder runs continuously; it idles until enabled via the web UI. */
     xTaskCreate(rec_task, "rec_task", 6144, NULL, 4, NULL);
+    ble_init();
 }
