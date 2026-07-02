@@ -107,6 +107,7 @@ static EventGroupHandle_t wifi_event_group;
 #define MAX_SCAN_RESULTS   24
 
 static int wifi_retry_count;
+static bool wifi_got_ip_once;
 static wifi_ap_record_t scan_results[MAX_SCAN_RESULTS];
 static uint16_t scan_result_count;
 static bool camera_ready;
@@ -472,7 +473,14 @@ static void wifi_event_handler_sta(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (wifi_retry_count < WIFI_MAXIMUM_RETRY) {
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        if (wifi_got_ip_once) {
+            /* An established link dropped (e.g. router reboot / signal loss):
+               reconnect forever with a short backoff so the board self-heals. */
+            ESP_LOGW(TAG, "WiFi lost, reconnecting...");
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_wifi_connect();
+        } else if (wifi_retry_count < WIFI_MAXIMUM_RETRY) {
             wifi_retry_count++;
             ESP_LOGI(TAG, "WiFi disconnected, retrying (%d/%d)...",
                      wifi_retry_count, WIFI_MAXIMUM_RETRY);
@@ -481,11 +489,11 @@ static void wifi_event_handler_sta(void *arg, esp_event_base_t event_base,
             ESP_LOGW(TAG, "WiFi connection failed, switching to provisioning mode");
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
         }
-        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         wifi_retry_count = 0;
+        wifi_got_ip_once = true;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -533,6 +541,9 @@ static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* Always-on camera on mains power: disable modem sleep. v6.0 defaults to
+       WIFI_PS_MIN_MODEM, which adds latency and packet loss for a server role. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(TAG, "WiFi STA started, connecting to %s...", ssid);
     EventBits_t bits = xEventGroupWaitBits(
         wifi_event_group,
@@ -936,20 +947,19 @@ static esp_err_t index_handler(httpd_req_t *req) {
     httpd_resp_sendstr_chunk(req, "</span></div></section>");
 
     /* Firmware / OTA card */
+    /* Build metadata is compiler/CMake/git controlled ASCII — no HTML escaping
+       needed, and large escape buffers here overflow the httpd task stack. */
     const esp_app_desc_t *app = esp_app_get_description();
     char fw_line[128], tools_line[160];
-    char fw_html[sizeof(fw_line) * 6 + 1], tools_html[sizeof(tools_line) * 6 + 1];
     snprintf(fw_line, sizeof(fw_line), "%s %s (built %s %s)",
              app->project_name, app->version, app->date, app->time);
-    snprintf(tools_line, sizeof(tools_line), "ESP-IDF %s · GCC %s", app->idf_ver, __VERSION__);
-    html_escape_string(fw_html, sizeof(fw_html), fw_line);
-    html_escape_string(tools_html, sizeof(tools_html), tools_line);
+    snprintf(tools_line, sizeof(tools_line), "ESP-IDF %s / GCC %s", app->idf_ver, __VERSION__);
     httpd_resp_sendstr_chunk(req,
         "<section class='card'><h3>Firmware</h3>"
         "<div class='meta' style='margin:0 0 4px'><span>Running: ");
-    httpd_resp_sendstr_chunk(req, fw_html);
+    httpd_resp_sendstr_chunk(req, fw_line);
     httpd_resp_sendstr_chunk(req, "</span></div><div class='meta' style='margin:0 0 12px'><span>Built with: ");
-    httpd_resp_sendstr_chunk(req, tools_html);
+    httpd_resp_sendstr_chunk(req, tools_line);
     httpd_resp_sendstr_chunk(req,
         "</span></div>"
         "<div class='toolbar' style='margin:0 0 10px'>"
@@ -1036,10 +1046,15 @@ static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 12;
     config.max_resp_headers = 8;
+    /* index_handler builds sizable HTML on-stack; 4 KB default is too tight. */
+    config.stack_size = 8192;
     /* Short-lived requests; keep socket use small so the LWIP pool is shared
        with the stream server (port 81) and mDNS without exhaustion. */
     config.max_open_sockets = 4;
     config.lru_purge_enable = true;
+    /* Bound blocked I/O so a stalled client on weak WiFi can't wedge the worker. */
+    config.recv_wait_timeout = 8;
+    config.send_wait_timeout = 8;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &uri_index);
@@ -1073,6 +1088,8 @@ static httpd_handle_t start_stream_webserver(void) {
     /* One socket per concurrent stream, plus headroom to accept + reject extras. */
     config.max_open_sockets = STREAM_MAX_CLIENTS + 2;
     config.lru_purge_enable = false;
+    config.recv_wait_timeout = 8;
+    config.send_wait_timeout = 8;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_register_uri_handler(server, &uri_stream);
