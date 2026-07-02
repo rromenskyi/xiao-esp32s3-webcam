@@ -1,5 +1,7 @@
 # XIAO ESP32S3 Sense Webcam
 
+[![firmware](https://github.com/rromenskyi/xiao-esp32s3-webcam/actions/workflows/firmware.yml/badge.svg)](https://github.com/rromenskyi/xiao-esp32s3-webcam/actions/workflows/firmware.yml)
+
 ESP-IDF firmware for the Seeed Studio XIAO ESP32S3 Sense. It exposes the onboard
 OV2640 camera as an MJPEG stream over WiFi with a polished web UI, uses the
 onboard PDM microphone and microSD card, and supports firmware updates over the

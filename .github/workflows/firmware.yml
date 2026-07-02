@@ -1,0 +1,87 @@
+name: firmware
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build firmware (ESP-IDF v5.4, target esp32s3)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4
+          target: esp32s3
+          path: '.'
+
+      - name: Collect artifacts and build OTA manifest
+        run: |
+          set -euo pipefail
+          # Channel: stable on v* tags, nightly on main, ci for PRs.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            CHANNEL=stable; TAG="$GITHUB_REF_NAME"
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            CHANNEL=nightly; TAG=nightly
+          else
+            CHANNEL=ci; TAG="ci-${GITHUB_SHA::7}"
+          fi
+          mkdir -p dist
+          cp build/xiao_s3_webcam.bin        dist/
+          cp build/bootloader/bootloader.bin dist/
+          cp build/partition_table/partition-table.bin dist/
+          SHA=$(sha256sum dist/xiao_s3_webcam.bin | awk '{print $1}')
+          SIZE=$(stat -c%s dist/xiao_s3_webcam.bin)
+          URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}/xiao_s3_webcam.bin"
+          cat > dist/manifest.json <<EOF
+          {
+            "channel": "${CHANNEL}",
+            "version": "${TAG}-${GITHUB_SHA::7}",
+            "sha256": "${SHA}",
+            "size": ${SIZE},
+            "file": "xiao_s3_webcam.bin",
+            "url": "${URL}"
+          }
+          EOF
+          echo "CHANNEL=$CHANNEL" >> "$GITHUB_ENV"
+          echo "----- manifest.json -----"; cat dist/manifest.json
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ env.CHANNEL }}
+          path: dist/
+          if-no-files-found: error
+
+      # --- nightly channel: rolling prerelease on every push to main ---
+      - name: Reset nightly release/tag
+        if: github.ref == 'refs/heads/main'
+        run: gh release delete nightly --cleanup-tag --yes || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Publish nightly
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly
+          prerelease: true
+          files: dist/*
+
+      # --- stable channel: proper release on v* tags ---
+      - name: Publish stable release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          make_latest: true
+          generate_release_notes: true
