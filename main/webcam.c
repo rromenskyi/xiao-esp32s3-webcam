@@ -28,6 +28,9 @@
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "mdns.h"
+#include "esp_netif_sntp.h"
+#include "esp_sntp.h"
+#include <time.h>
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -59,6 +62,8 @@ static esp_err_t config_backup_handler(httpd_req_t *req);
 static esp_err_t wifi_list_handler(httpd_req_t *req);
 static esp_err_t wifi_add_handler(httpd_req_t *req);
 static esp_err_t wifi_del_handler(httpd_req_t *req);
+static esp_err_t time_handler(httpd_req_t *req);
+static esp_err_t ntp_handler(httpd_req_t *req);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
@@ -139,7 +144,9 @@ static char device_ip[16] = "";
 typedef struct { char ssid[33]; char pass[64]; } wifi_cred_t;
 static wifi_cred_t wifi_creds[WIFI_MAX_CREDS];
 static int wifi_cred_count;
-static volatile bool wifi_selecting;   /* true while trying candidates at boot */
+static volatile bool wifi_selecting;   /* true while trying candidates */
+static volatile bool wifi_connected;   /* have a live association + IP */
+static int wifi_down_cycles;           /* manager ticks with no connection */
 static wifi_ap_record_t scan_results[MAX_SCAN_RESULTS];
 static uint16_t scan_result_count;
 static bool camera_ready;
@@ -165,6 +172,13 @@ static volatile bool rec_enabled;
 static bool rec_audio = true;              /* mux audio into clips when mic is present */
 static int  rec_budget_pct = 80;           /* keep total clips under this % of the card */
 static int  rec_seg_min = 15;              /* rotate to a new clip every N minutes (configurable) */
+
+/* NTP time sync (opt-in; off by default). When synced, clips are named by time. */
+#define SYS_NVS_NS "sys_cfg"
+static bool ntp_enabled = false;
+static char ntp_tz[48] = "UTC0";
+static volatile bool time_synced = false;
+static bool sntp_started = false;
 static char rec_status[96] = "idle";
 
 static camera_config_t camera_config = {
@@ -278,6 +292,8 @@ static void sd_config_save_all(void) {
     fprintf(f, "rec_pct=%d\n", rec_budget_pct);
     fprintf(f, "rec_audio=%d\n", rec_audio ? 1 : 0);
     fprintf(f, "rec_segmin=%d\n", rec_seg_min);
+    fprintf(f, "ntp=%d\n", ntp_enabled ? 1 : 0);
+    fprintf(f, "tz=%s\n", ntp_tz);
     fclose(f);
     ESP_LOGI(TAG, "Config written to %s (%d networks)", SD_CONFIG_PATH, wifi_cred_count);
 }
@@ -306,6 +322,8 @@ static bool sd_config_load(void) {
         } else if (strcmp(k, "rec_pct") == 0)   { int p = atoi(v); if (p >= 10 && p <= 95) rec_budget_pct = p; }
         else if (strcmp(k, "rec_audio") == 0)   rec_audio = atoi(v) ? true : false;
         else if (strcmp(k, "rec_segmin") == 0)  { int m = atoi(v); if (m >= 1 && m <= 60) rec_seg_min = m; }
+        else if (strcmp(k, "ntp") == 0)         ntp_enabled = atoi(v) ? true : false;
+        else if (strcmp(k, "tz") == 0)          strlcpy(ntp_tz, v, sizeof(ntp_tz));
     }
     if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }
     fclose(f);
@@ -615,6 +633,48 @@ static void rec_cfg_save(void) {
     nvs_close(h);
 }
 
+/* ---- NTP time sync (opt-in) ---- */
+static void sys_cfg_load(void) {
+    nvs_handle_t h;
+    if (nvs_open(SYS_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    int32_t v;
+    if (nvs_get_i32(h, "ntp", &v) == ESP_OK) ntp_enabled = v ? true : false;
+    size_t tl = sizeof(ntp_tz);
+    nvs_get_str(h, "tz", ntp_tz, &tl);
+    nvs_close(h);
+}
+static void sys_cfg_save(void) {
+    nvs_handle_t h;
+    if (nvs_open(SYS_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, "ntp", ntp_enabled ? 1 : 0);
+    nvs_set_str(h, "tz", ntp_tz);
+    nvs_commit(h);
+    nvs_close(h);
+}
+static void time_sync_cb(struct timeval *tv) {
+    time_synced = true;
+    ESP_LOGI(TAG, "System time synced via NTP");
+}
+/* Start or stop SNTP to match ntp_enabled / ntp_tz. Safe to call repeatedly. */
+static void ntp_apply(void) {
+    setenv("TZ", ntp_tz, 1);
+    tzset();
+    if (ntp_enabled && !sntp_started) {
+        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        cfg.sync_cb = time_sync_cb;
+        cfg.start = true;
+        if (esp_netif_sntp_init(&cfg) == ESP_OK) {
+            sntp_started = true;
+            ESP_LOGI(TAG, "NTP started (tz=%s)", ntp_tz);
+        }
+    } else if (!ntp_enabled && sntp_started) {
+        esp_netif_sntp_deinit();
+        sntp_started = false;
+        time_synced = false;
+        ESP_LOGI(TAG, "NTP stopped");
+    }
+}
+
 /* Minimal AVI (RIFF) writer. Little-endian target, so plain fwrite of u32 is fine. */
 typedef struct { uint32_t off, size; uint8_t audio; } rec_idx_t;
 typedef struct {
@@ -720,6 +780,14 @@ static void avi_end(avi_t *w) {
 
 static int rec_seq = -1;
 static void rec_next_path(char *out, size_t n) {
+    if (time_synced) {   /* real-time name, e.g. clip-20260702-143005.avi */
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        snprintf(out, n, REC_DIR "/clip-%04d%02d%02d-%02d%02d%02d.avi",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        return;
+    }
     if (rec_seq < 0) {
         rec_seq = 0;
         DIR *d = opendir(REC_DIR);
@@ -737,6 +805,7 @@ static void rec_enforce_budget(void) {
     if (!sd_ready || !sd_card) return;
     static char names[256][32];
     static uint64_t sizes[256];
+    static time_t mtimes[256];
     uint64_t cap = (uint64_t)sd_card->csd.capacity * sd_card->csd.sector_size;
     uint64_t budget = cap / 100 * rec_budget_pct;
     int n = 0; uint64_t total = 0;
@@ -747,18 +816,20 @@ static void rec_enforce_budget(void) {
         if (strncmp(e->d_name, "clip", 4) != 0) continue;
         char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", e->d_name);
         struct stat st; if (stat(full, &st) != 0) continue;
-        strlcpy(names[n], e->d_name, sizeof(names[n])); sizes[n] = st.st_size; total += st.st_size; n++;
+        strlcpy(names[n], e->d_name, sizeof(names[n])); sizes[n] = st.st_size; mtimes[n] = st.st_mtime;
+        total += st.st_size; n++;
     }
     closedir(d);
     while (total > budget && n > 0) {
+        /* Oldest by modification time — robust across numbered and timestamped names. */
         int oldest = 0;
-        for (int i = 1; i < n; i++) if (strcmp(names[i], names[oldest]) < 0) oldest = i;
+        for (int i = 1; i < n; i++) if (mtimes[i] < mtimes[oldest]) oldest = i;
         char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", names[oldest]);
         unlink(full);
         ESP_LOGI(TAG, "rec budget: deleted %s", names[oldest]);
         total -= sizes[oldest];
         n--;
-        if (oldest != n) { strlcpy(names[oldest], names[n], sizeof(names[oldest])); sizes[oldest] = sizes[n]; }
+        if (oldest != n) { strlcpy(names[oldest], names[n], sizeof(names[oldest])); sizes[oldest] = sizes[n]; mtimes[oldest] = mtimes[n]; }
     }
 }
 
@@ -1004,6 +1075,37 @@ static esp_err_t wifi_del_handler(httpd_req_t *req) {
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+static esp_err_t time_handler(httpd_req_t *req) {
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
+    char tz_esc[96], body[256];
+    json_escape_string(tz_esc, sizeof(tz_esc), ntp_tz);
+    snprintf(body, sizeof(body), "{\"ntp\":%s,\"synced\":%s,\"tz\":\"%s\",\"time\":\"%s\"}",
+             ntp_enabled ? "true" : "false", time_synced ? "true" : "false", tz_esc, ts);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t ntp_handler(httpd_req_t *req) {
+    char q[160], v[96];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "tz", v, sizeof(v)) == ESP_OK) {
+            char dec[48];
+            url_decode(dec, v, sizeof(dec));
+            strlcpy(ntp_tz, dec, sizeof(ntp_tz));
+        }
+        if (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK) {
+            ntp_enabled = atoi(v) ? true : false;
+        }
+    }
+    sys_cfg_save();
+    ntp_apply();
+    return time_handler(req);
+}
+
 static esp_err_t init_sd_card(void) {
     return mount_sd_card(false);
 }
@@ -1047,17 +1149,15 @@ static void wifi_event_handler_sta(void *arg, esp_event_base_t event_base,
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         if (!wifi_selecting) esp_wifi_connect();   /* during selection we connect manually */
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_connected = false;
         xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
         if (wifi_selecting) {
             /* Candidate attempt failed; let wifi_connect_best() move to the next. */
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
-        } else if (wifi_got_ip_once) {
-            /* An established link dropped (e.g. router reboot / signal loss):
-               reconnect forever with a short backoff so the board self-heals. */
-            ESP_LOGW(TAG, "WiFi lost, reconnecting...");
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            esp_wifi_connect();
         } else {
+            /* Quick reconnect to the current AP for transient drops; if it stays
+               down, wifi_manager_task re-scans and roams to another known net. */
+            vTaskDelay(pdMS_TO_TICKS(1000));
             esp_wifi_connect();
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -1066,6 +1166,8 @@ static void wifi_event_handler_sta(void *arg, esp_event_base_t event_base,
         snprintf(device_ip, sizeof(device_ip), IPSTR, IP2STR(&event->ip_info.ip));
         wifi_retry_count = 0;
         wifi_got_ip_once = true;
+        wifi_connected = true;
+        wifi_down_cycles = 0;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -1129,6 +1231,24 @@ static bool wifi_connect_best(void) {
     return false;
 }
 
+/* Roam: if the current network stays down, re-scan and try all known networks. */
+static void wifi_manager_task(void *arg) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        if (wifi_selecting) continue;
+        if (wifi_connected) { wifi_down_cycles = 0; continue; }
+        if (++wifi_down_cycles >= 2) {   /* ~10s down: the current AP isn't coming back */
+            ESP_LOGW(TAG, "Network down; scanning to roam across known networks...");
+            wifi_selecting = true;
+            esp_wifi_disconnect();
+            bool ok = wifi_connect_best();
+            wifi_selecting = false;
+            wifi_down_cycles = 0;
+            if (!ok) ESP_LOGW(TAG, "No known network reachable yet; will retry");
+        }
+    }
+}
+
 static void wifi_init_sta(void) {
     wifi_creds_load();               /* known networks from NVS */
     if (sd_config_load()) {          /* merge any networks + settings from the SD card */
@@ -1162,7 +1282,9 @@ static void wifi_init_sta(void) {
     bool connected = wifi_connect_best();
     wifi_selecting = false;
     if (connected) {
-        return;   /* event handler now keeps the link alive (reconnects forever) */
+        /* Keep the link alive and roam across known networks if it drops. */
+        xTaskCreate(wifi_manager_task, "wifi_mgr", 4096, NULL, 4, NULL);
+        return;
     }
     ESP_LOGW(TAG, "No known network reachable; starting provisioning AP");
     ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler_sta));
@@ -1593,6 +1715,14 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
         "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
         "</section>"
+        "<section class='card'><h3>Time</h3>"
+        "<div class='meta' style='margin:0 0 10px'><span id='clock' style='font-variant-numeric:tabular-nums;font-size:16px;color:var(--text)'>--:--:--</span><span id='ntpState'>NTP off</span></div>"
+        "<div class='toolbar' style='margin:0'>"
+        "<label class='btn' style='cursor:pointer;gap:10px'>Enable NTP<input id='ntpOn' type='checkbox' style='width:18px;height:18px'></label>"
+        "<input id='tz' placeholder='TZ e.g. EET-2EEST,M3.5.0/3,M10.5.0/4' style='flex:2;min-width:150px;height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:0 10px'>"
+        "<button class='btn primary' id='tzSave' type='button'>Save TZ</button>"
+        "</div>"
+        "</section>"
         "<section class='card'><h3>WiFi networks</h3>"
         "<div id='wifiList' style='display:flex;flex-direction:column;gap:6px;margin-bottom:10px'></div>"
         "<div class='toolbar' style='margin:0 0 8px'>"
@@ -1654,6 +1784,10 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "async function wifiRefresh(){try{const d=await(await fetch('/wifi/list')).json();const l=document.getElementById('wifiList');l.innerHTML='';d.networks.forEach(ss=>{const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';const s=document.createElement('span');s.textContent=ss;r.appendChild(s);const del=document.createElement('button');del.className='btn danger';del.type='button';del.style.cssText='flex:0;min-width:60px;height:30px';del.textContent='Del';del.onclick=async()=>{await fetch('/wifi/del?ssid='+encodeURIComponent(ss),{method:'POST'});wifiRefresh();};r.appendChild(del);l.appendChild(r);});document.getElementById('wifiState').textContent=d.count+'/'+d.max+' networks'+(d.current?' - IP '+d.current:'');}catch(e){}}"
         "document.getElementById('wAdd').onclick=async()=>{const ss=document.getElementById('wSsid').value,pw=document.getElementById('wPass').value,st=document.getElementById('wifiState');if(!ss)return;const r=await fetch('/wifi/add?ssid='+encodeURIComponent(ss)+'&pass='+encodeURIComponent(pw),{method:'POST'});if(r.ok){document.getElementById('wSsid').value='';document.getElementById('wPass').value='';wifiRefresh();}else{st.textContent=await r.text();}};"
         "wifiRefresh();"
+        "async function timeRefresh(){try{const d=await(await fetch('/time')).json();document.getElementById('clock').textContent=d.time;document.getElementById('ntpState').textContent=d.ntp?(d.synced?'NTP synced':'NTP syncing...'):'NTP off (clips numbered)';document.getElementById('ntpOn').checked=d.ntp;var t=document.getElementById('tz');if(document.activeElement!==t)t.value=d.tz;}catch(e){}}"
+        "document.getElementById('ntpOn').onchange=async e=>{await fetch('/ntp?on='+(e.target.checked?1:0),{method:'POST'});setTimeout(timeRefresh,600);};"
+        "document.getElementById('tzSave').onclick=async()=>{await fetch('/ntp?tz='+encodeURIComponent(document.getElementById('tz').value),{method:'POST'});setTimeout(timeRefresh,600);};"
+        "setInterval(timeRefresh,2000);timeRefresh();"
         "fbLoad('/sdcard');"
         "</script></body></html>");
     return httpd_resp_sendstr_chunk(req, NULL);
@@ -1717,10 +1851,12 @@ static httpd_uri_t uri_cfg_backup = { .uri = "/config/backup", .method = HTTP_PO
 static httpd_uri_t uri_wifi_list  = { .uri = "/wifi/list", .method = HTTP_GET,  .handler = wifi_list_handler, .user_ctx = NULL };
 static httpd_uri_t uri_wifi_add   = { .uri = "/wifi/add",  .method = HTTP_POST, .handler = wifi_add_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_wifi_del   = { .uri = "/wifi/del",  .method = HTTP_POST, .handler = wifi_del_handler,  .user_ctx = NULL };
+static httpd_uri_t uri_time       = { .uri = "/time",      .method = HTTP_GET,  .handler = time_handler,     .user_ctx = NULL };
+static httpd_uri_t uri_ntp        = { .uri = "/ntp",       .method = HTTP_POST, .handler = ntp_handler,      .user_ctx = NULL };
 
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 22;
     config.max_resp_headers = 8;
     /* index_handler builds sizable HTML on-stack; 4 KB default is too tight. */
     config.stack_size = 8192;
@@ -1748,6 +1884,8 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_wifi_list);
         httpd_register_uri_handler(server, &uri_wifi_add);
         httpd_register_uri_handler(server, &uri_wifi_del);
+        httpd_register_uri_handler(server, &uri_time);
+        httpd_register_uri_handler(server, &uri_ntp);
         ESP_LOGI(TAG, "HTTP server started");
     }
     return server;
@@ -2309,7 +2447,9 @@ void app_main(void) {
     }
     init_sd_card();
     rec_cfg_load();
+    sys_cfg_load();
     wifi_init_sta();
+    ntp_apply();   /* start SNTP if enabled (network is up now) */
     init_mdns();
     start_webserver();
     start_stream_webserver();
