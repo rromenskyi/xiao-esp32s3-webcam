@@ -26,7 +26,11 @@
 #include "driver/i2s_pdm.h"
 #include "esp_ota_ops.h"
 #include "esp_app_desc.h"
+#include "esp_heap_caps.h"
 #include "mdns.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* WiFi credentials stored in NVS */
 #define NVS_WIFI_NAMESPACE "wifi_cfg"
@@ -45,6 +49,12 @@ static void init_mdns(void);
 static esp_err_t init_mic(void);
 static esp_err_t audio_handler(httpd_req_t *req);
 static esp_err_t ota_handler(httpd_req_t *req);
+static esp_err_t rec_toggle_handler(httpd_req_t *req);
+static esp_err_t rec_list_handler(httpd_req_t *req);
+static esp_err_t files_list_handler(httpd_req_t *req);
+static esp_err_t download_handler(httpd_req_t *req);
+static esp_err_t delete_handler(httpd_req_t *req);
+static void rec_enforce_budget(void);
 static esp_err_t init_sd_card(void);
 static esp_err_t mount_sd_card(bool format_if_mount_failed);
 static void wifi_init_sta(void);
@@ -116,6 +126,21 @@ static sdmmc_card_t *sd_card;
 static char sd_status_text[96] = "SD not mounted";
 static bool mic_ready;
 static i2s_chan_handle_t mic_rx_chan;
+static SemaphoreHandle_t mic_lock;   /* only one mic consumer (rec vs /audio.wav) at a time */
+
+/* Camera settings persistence */
+#define NVS_CAM_NAMESPACE "cam_cfg"
+
+/* Loop (dashcam) recording to SD */
+#define REC_DIR            "/sdcard/rec"
+#define REC_NVS_NS         "rec_cfg"
+#define REC_TARGET_FPS     10
+#define REC_SEG_MAX_BYTES  (16u * 1024 * 1024)
+#define REC_SEG_MAX_FRAMES 2400
+static volatile bool rec_enabled;
+static bool rec_audio = true;              /* mux audio into clips when mic is present */
+static int  rec_budget_pct = 80;           /* keep total clips under this % of the card */
+static char rec_status[96] = "idle";
 
 static camera_config_t camera_config = {
     .pin_pwdn  = CAM_PIN_PWDN,
@@ -183,6 +208,30 @@ static esp_err_t wifi_credentials_save(const char *ssid, const char *pass) {
     return err;
 }
 
+/* Persist one camera setting (framesize, hmirror, vflip, ...) to NVS. */
+static void cam_setting_save(const char *key, int32_t val) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_CAM_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, key, val);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* Restore saved camera settings so stream and recording use the same look. */
+static void cam_settings_load(sensor_t *s) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_CAM_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
+    int32_t v;
+    if (nvs_get_i32(h, "framesize", &v) == ESP_OK)   s->set_framesize(s, (framesize_t)v);
+    if (nvs_get_i32(h, "quality", &v) == ESP_OK)     s->set_quality(s, v);
+    if (nvs_get_i32(h, "brightness", &v) == ESP_OK)  s->set_brightness(s, v);
+    if (nvs_get_i32(h, "contrast", &v) == ESP_OK)    s->set_contrast(s, v);
+    if (nvs_get_i32(h, "saturation", &v) == ESP_OK)  s->set_saturation(s, v);
+    if (nvs_get_i32(h, "hmirror", &v) == ESP_OK)     s->set_hmirror(s, v);
+    if (nvs_get_i32(h, "vflip", &v) == ESP_OK)       s->set_vflip(s, v);
+    nvs_close(h);
+}
+
 static esp_err_t init_camera(void) {
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
@@ -195,6 +244,7 @@ static esp_err_t init_camera(void) {
     s->set_brightness(s, 0);
     s->set_contrast(s, 0);
     s->set_saturation(s, 0);
+    cam_settings_load(s);   /* override defaults with persisted flip/mirror/resolution/etc. */
     camera_ready = true;
     ESP_LOGI(TAG, "Camera initialized");
     return ESP_OK;
@@ -275,6 +325,12 @@ static esp_err_t audio_handler(httpd_req_t *req) {
         httpd_resp_set_type(req, "text/plain");
         return httpd_resp_sendstr(req, "Microphone is not initialized.");
     }
+    /* One mic consumer at a time: the recorder may hold it. */
+    if (!mic_lock || xSemaphoreTake(mic_lock, 0) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Microphone is busy (recording).");
+    }
 
     int secs = 5;
     int gain = 8;
@@ -304,6 +360,7 @@ static esp_err_t audio_handler(httpd_req_t *req) {
     const size_t buf_bytes = 2048;
     uint8_t *buf = malloc(buf_bytes);
     if (!buf) {
+        xSemaphoreGive(mic_lock);
         return ESP_ERR_NO_MEM;
     }
 
@@ -339,6 +396,7 @@ static esp_err_t audio_handler(httpd_req_t *req) {
     }
 
     free(buf);
+    xSemaphoreGive(mic_lock);
     if (res == ESP_OK) {
         res = httpd_resp_send_chunk(req, NULL, 0);
     }
@@ -430,6 +488,349 @@ static esp_err_t ota_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* ===================== Loop recording (AVI: MJPEG video + PCM audio) ===================== */
+
+static void rec_cfg_load(void) {
+    nvs_handle_t h;
+    if (nvs_open(REC_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    int32_t v;
+    if (nvs_get_i32(h, "pct", &v) == ESP_OK && v >= 10 && v <= 95) rec_budget_pct = v;
+    if (nvs_get_i32(h, "audio", &v) == ESP_OK) rec_audio = v ? true : false;
+    nvs_close(h);
+}
+static void rec_cfg_save(void) {
+    nvs_handle_t h;
+    if (nvs_open(REC_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, "pct", rec_budget_pct);
+    nvs_set_i32(h, "audio", rec_audio ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* Minimal AVI (RIFF) writer. Little-endian target, so plain fwrite of u32 is fine. */
+typedef struct { uint32_t off, size; uint8_t audio; } rec_idx_t;
+typedef struct {
+    FILE *f;
+    bool audio;
+    uint32_t vframes, abytes, movi_bytes;
+    long p_riff, p_totframes, p_vidlen, p_audlen, p_movisz, movi_ref;
+    rec_idx_t *idx; uint32_t idx_cap, idx_len;
+} avi_t;
+
+static void w_u32(FILE *f, uint32_t v) { uint8_t b[4] = {v, v >> 8, v >> 16, v >> 24}; fwrite(b, 1, 4, f); }
+static void w_u16(FILE *f, uint16_t v) { uint8_t b[2] = {v, v >> 8}; fwrite(b, 1, 2, f); }
+static void w_tag(FILE *f, const char *t) { fwrite(t, 1, 4, f); }
+static void patch_u32(FILE *f, long pos, uint32_t v) { long cur = ftell(f); fseek(f, pos, SEEK_SET); w_u32(f, v); fseek(f, cur, SEEK_SET); }
+
+static bool avi_begin(avi_t *w, const char *path, int width, int height, int fps, bool audio, int sr) {
+    memset(w, 0, sizeof(*w));
+    w->f = fopen(path, "wb");
+    if (!w->f) return false;
+    w->audio = audio;
+    w->idx_cap = 512;
+    w->idx = heap_caps_malloc(w->idx_cap * sizeof(rec_idx_t), MALLOC_CAP_SPIRAM);
+    if (!w->idx) w->idx = malloc(w->idx_cap * sizeof(rec_idx_t));
+    if (!w->idx) { fclose(w->f); w->f = NULL; return false; }
+    FILE *f = w->f;
+    uint32_t hdrl = audio ? 292 : 192;
+    w_tag(f, "RIFF"); w->p_riff = ftell(f); w_u32(f, 0); w_tag(f, "AVI ");
+    w_tag(f, "LIST"); w_u32(f, hdrl); w_tag(f, "hdrl");
+    w_tag(f, "avih"); w_u32(f, 56);
+    w_u32(f, fps > 0 ? 1000000 / fps : 100000); w_u32(f, 0); w_u32(f, 0); w_u32(f, 0x10);
+    w->p_totframes = ftell(f); w_u32(f, 0);
+    w_u32(f, 0); w_u32(f, audio ? 2 : 1); w_u32(f, 0);
+    w_u32(f, width); w_u32(f, height); w_u32(f, 0); w_u32(f, 0); w_u32(f, 0); w_u32(f, 0);
+    /* video stream */
+    w_tag(f, "LIST"); w_u32(f, 116); w_tag(f, "strl");
+    w_tag(f, "strh"); w_u32(f, 56);
+    w_tag(f, "vids"); w_tag(f, "MJPG"); w_u32(f, 0); w_u16(f, 0); w_u16(f, 0);
+    w_u32(f, 0); w_u32(f, 1); w_u32(f, fps > 0 ? fps : 10); w_u32(f, 0);
+    w->p_vidlen = ftell(f); w_u32(f, 0);
+    w_u32(f, 0); w_u32(f, 0xFFFFFFFF); w_u32(f, 0);
+    w_u16(f, 0); w_u16(f, 0); w_u16(f, width); w_u16(f, height);
+    w_tag(f, "strf"); w_u32(f, 40);
+    w_u32(f, 40); w_u32(f, width); w_u32(f, height); w_u16(f, 1); w_u16(f, 24);
+    w_tag(f, "MJPG"); w_u32(f, width * height * 3); w_u32(f, 0); w_u32(f, 0); w_u32(f, 0); w_u32(f, 0);
+    /* audio stream */
+    if (audio) {
+        w_tag(f, "LIST"); w_u32(f, 92); w_tag(f, "strl");
+        w_tag(f, "strh"); w_u32(f, 56);
+        w_tag(f, "auds"); w_u32(f, 0); w_u32(f, 0); w_u16(f, 0); w_u16(f, 0);
+        w_u32(f, 0); w_u32(f, 1); w_u32(f, sr); w_u32(f, 0);
+        w->p_audlen = ftell(f); w_u32(f, 0);
+        w_u32(f, 0); w_u32(f, 0xFFFFFFFF); w_u32(f, 2);
+        w_u16(f, 0); w_u16(f, 0); w_u16(f, 0); w_u16(f, 0);
+        w_tag(f, "strf"); w_u32(f, 16);
+        w_u16(f, 1); w_u16(f, 1); w_u32(f, sr); w_u32(f, sr * 2); w_u16(f, 2); w_u16(f, 16);
+    }
+    w_tag(f, "LIST"); w->p_movisz = ftell(f); w_u32(f, 0); w->movi_ref = ftell(f); w_tag(f, "movi");
+    return true;
+}
+
+static void avi_chunk(avi_t *w, const char *fourcc, const uint8_t *data, uint32_t len, uint8_t is_audio) {
+    if (!w->f) return;
+    if (w->idx_len >= w->idx_cap) {
+        uint32_t nc = w->idx_cap * 2;
+        rec_idx_t *ni = heap_caps_realloc(w->idx, nc * sizeof(rec_idx_t), MALLOC_CAP_SPIRAM);
+        if (!ni) ni = realloc(w->idx, nc * sizeof(rec_idx_t));
+        if (!ni) return;
+        w->idx = ni; w->idx_cap = nc;
+    }
+    long pos = ftell(w->f);
+    w->idx[w->idx_len].off = (uint32_t)(pos - w->movi_ref);
+    w->idx[w->idx_len].size = len;
+    w->idx[w->idx_len].audio = is_audio;
+    w->idx_len++;
+    w_tag(w->f, fourcc); w_u32(w->f, len);
+    fwrite(data, 1, len, w->f);
+    uint32_t total = 8 + len;
+    if (len & 1) { uint8_t z = 0; fwrite(&z, 1, 1, w->f); total++; }
+    w->movi_bytes += total;
+    if (is_audio) w->abytes += len; else w->vframes++;
+}
+static void avi_add_video(avi_t *w, const uint8_t *j, uint32_t n) { avi_chunk(w, "00dc", j, n, 0); }
+static void avi_add_audio(avi_t *w, const uint8_t *p, uint32_t n) { avi_chunk(w, "01wb", p, n, 1); }
+
+static void avi_end(avi_t *w) {
+    if (!w->f) return;
+    FILE *f = w->f;
+    w_tag(f, "idx1"); w_u32(f, w->idx_len * 16);
+    for (uint32_t i = 0; i < w->idx_len; i++) {
+        w_tag(f, w->idx[i].audio ? "01wb" : "00dc");
+        w_u32(f, 0x10); w_u32(f, w->idx[i].off); w_u32(f, w->idx[i].size);
+    }
+    long filesize = ftell(f);
+    patch_u32(f, w->p_riff, (uint32_t)(filesize - 8));
+    patch_u32(f, w->p_totframes, w->vframes);
+    patch_u32(f, w->p_vidlen, w->vframes);
+    if (w->audio) patch_u32(f, w->p_audlen, w->abytes / 2);
+    patch_u32(f, w->p_movisz, 4 + w->movi_bytes);
+    fclose(f);
+    w->f = NULL;
+    free(w->idx); w->idx = NULL;
+}
+
+static int rec_seq = -1;
+static void rec_next_path(char *out, size_t n) {
+    if (rec_seq < 0) {
+        rec_seq = 0;
+        DIR *d = opendir(REC_DIR);
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) { int x; if (sscanf(e->d_name, "clip%d.avi", &x) == 1 && x >= rec_seq) rec_seq = x + 1; }
+            closedir(d);
+        }
+    }
+    snprintf(out, n, REC_DIR "/clip%05d.avi", rec_seq++);
+}
+
+/* Delete oldest clips until total recorded size fits under the budget (% of card). */
+static void rec_enforce_budget(void) {
+    if (!sd_ready || !sd_card) return;
+    static char names[256][32];
+    static uint64_t sizes[256];
+    uint64_t cap = (uint64_t)sd_card->csd.capacity * sd_card->csd.sector_size;
+    uint64_t budget = cap / 100 * rec_budget_pct;
+    int n = 0; uint64_t total = 0;
+    DIR *d = opendir(REC_DIR);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < 256) {
+        if (strncmp(e->d_name, "clip", 4) != 0) continue;
+        char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", e->d_name);
+        struct stat st; if (stat(full, &st) != 0) continue;
+        strlcpy(names[n], e->d_name, sizeof(names[n])); sizes[n] = st.st_size; total += st.st_size; n++;
+    }
+    closedir(d);
+    while (total > budget && n > 0) {
+        int oldest = 0;
+        for (int i = 1; i < n; i++) if (strcmp(names[i], names[oldest]) < 0) oldest = i;
+        char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", names[oldest]);
+        unlink(full);
+        ESP_LOGI(TAG, "rec budget: deleted %s", names[oldest]);
+        total -= sizes[oldest];
+        n--;
+        if (oldest != n) { strlcpy(names[oldest], names[n], sizeof(names[oldest])); sizes[oldest] = sizes[n]; }
+    }
+}
+
+static void rec_task(void *arg) {
+    avi_t w; bool open = false, have_mic = false; char cur[32] = "";
+    int16_t *apcm = NULL;
+    const int aframe = MIC_SAMPLE_RATE / REC_TARGET_FPS;
+    float dcx = 0, dcy = 0;
+    while (1) {
+        if (!rec_enabled || !sd_ready || !camera_ready) {
+            if (open) { avi_end(&w); open = false; rec_enforce_budget(); }
+            if (have_mic) { xSemaphoreGive(mic_lock); have_mic = false; }
+            snprintf(rec_status, sizeof(rec_status), "%s", !sd_ready ? "idle (no SD)" : "idle");
+            vTaskDelay(pdMS_TO_TICKS(400));
+            continue;
+        }
+        bool want_audio = rec_audio && mic_ready;
+        if (want_audio && !have_mic) { if (xSemaphoreTake(mic_lock, 0) == pdTRUE) have_mic = true; }
+        if (!want_audio && have_mic) { xSemaphoreGive(mic_lock); have_mic = false; }
+
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        if (!open) {
+            mkdir(REC_DIR, 0777);
+            char path[80]; rec_next_path(path, sizeof(path));
+            const char *bn = strrchr(path, '/'); strlcpy(cur, bn ? bn + 1 : path, sizeof(cur));
+            if (avi_begin(&w, path, fb->width, fb->height, REC_TARGET_FPS, have_mic, MIC_SAMPLE_RATE)) {
+                open = true;
+            } else {
+                esp_camera_fb_return(fb);
+                snprintf(rec_status, sizeof(rec_status), "error: cannot create clip");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+        }
+        avi_add_video(&w, fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+
+        if (have_mic) {
+            if (!apcm) apcm = malloc(aframe * 2);
+            size_t got = 0;
+            if (apcm) i2s_channel_read(mic_rx_chan, apcm, aframe * 2, &got, pdMS_TO_TICKS(150));
+            if (got >= 2) {
+                size_t cnt = got / 2;
+                for (size_t i = 0; i < cnt; i++) {
+                    float x = apcm[i]; dcy = x - dcx + 0.995f * dcy; dcx = x;
+                    int v = (int)(dcy * 8);
+                    if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+                    apcm[i] = (int16_t)v;
+                }
+                avi_add_audio(&w, (uint8_t *)apcm, cnt * 2);
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1000 / REC_TARGET_FPS));
+        }
+
+        snprintf(rec_status, sizeof(rec_status), "REC %s (%u frames%s)", cur,
+                 (unsigned)w.vframes, have_mic ? "+audio" : "");
+        if (w.movi_bytes >= REC_SEG_MAX_BYTES || w.vframes >= REC_SEG_MAX_FRAMES) {
+            avi_end(&w); open = false; rec_enforce_budget();
+        }
+    }
+}
+
+static esp_err_t rec_toggle_handler(httpd_req_t *req) {
+    char q[64], v[16];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK) rec_enabled = atoi(v) ? true : false;
+        if (httpd_query_key_value(q, "pct", v, sizeof(v)) == ESP_OK) { int p = atoi(v); if (p >= 10 && p <= 95) { rec_budget_pct = p; rec_cfg_save(); } }
+        if (httpd_query_key_value(q, "audio", v, sizeof(v)) == ESP_OK) { rec_audio = atoi(v) ? true : false; rec_cfg_save(); }
+    }
+    char body[128];
+    snprintf(body, sizeof(body), "{\"enabled\":%s,\"audio\":%s,\"pct\":%d}",
+             rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t rec_list_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    uint64_t total = (sd_ready && sd_card) ? (uint64_t)sd_card->csd.capacity * sd_card->csd.sector_size : 0;
+    uint64_t used = 0;
+    httpd_resp_sendstr_chunk(req, "{\"clips\":[");
+    DIR *d = opendir(REC_DIR);
+    bool first = true;
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (strncmp(e->d_name, "clip", 4) != 0) continue;
+            char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", e->d_name);
+            struct stat st; if (stat(full, &st) != 0) continue;
+            used += st.st_size;
+            char item[320];
+            snprintf(item, sizeof(item), "%s{\"name\":\"%s\",\"size\":%lld}", first ? "" : ",", e->d_name, (long long)st.st_size);
+            first = false;
+            httpd_resp_sendstr_chunk(req, item);
+        }
+        closedir(d);
+    }
+    char tail[224];
+    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"used\":%llu,\"total\":%llu,\"status\":\"%s\"}",
+             rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct,
+             (unsigned long long)used, (unsigned long long)total, rec_status);
+    httpd_resp_sendstr_chunk(req, tail);
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+/* --- Generic SD file browser (confined to /sdcard) --- */
+static bool sd_path_ok(const char *p) {
+    return p && strncmp(p, "/sdcard", 7) == 0 && !strstr(p, "..");
+}
+
+static esp_err_t files_list_handler(httpd_req_t *req) {
+    char q[192], dir[128] = "/sdcard";
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        char v[128]; if (httpd_query_key_value(q, "dir", v, sizeof(v)) == ESP_OK) url_decode(dir, v, sizeof(dir));
+    }
+    if (!sd_path_ok(dir)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_FAIL; }
+    DIR *d = opendir(dir);
+    if (!d) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no such dir"); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    char dir_esc[192], open_json[224];
+    json_escape_string(dir_esc, sizeof(dir_esc), dir);
+    snprintf(open_json, sizeof(open_json), "{\"dir\":\"%s\",\"entries\":[", dir_esc);
+    httpd_resp_sendstr_chunk(req, open_json);
+    struct dirent *e; bool first = true;
+    while ((e = readdir(d))) {
+        char full[400]; snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+        struct stat st; if (stat(full, &st) != 0) continue;
+        char esc[128]; json_escape_string(esc, sizeof(esc), e->d_name);
+        char item[256];
+        snprintf(item, sizeof(item), "%s{\"name\":\"%s\",\"dir\":%s,\"size\":%lld}",
+                 first ? "" : ",", esc, S_ISDIR(st.st_mode) ? "true" : "false", (long long)st.st_size);
+        first = false;
+        httpd_resp_sendstr_chunk(req, item);
+    }
+    closedir(d);
+    httpd_resp_sendstr_chunk(req, "]}");
+    return httpd_resp_sendstr_chunk(req, NULL);
+}
+
+static esp_err_t download_handler(httpd_req_t *req) {
+    char q[224], path[160] = "", v[160];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
+        httpd_query_key_value(q, "path", v, sizeof(v)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no path"); return ESP_FAIL;
+    }
+    url_decode(path, v, sizeof(path));
+    if (!sd_path_ok(path)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_FAIL; }
+    FILE *f = fopen(path, "rb");
+    if (!f) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found"); return ESP_FAIL; }
+    const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
+    httpd_resp_set_type(req, strstr(path, ".avi") ? "video/x-msvideo" :
+                             strstr(path, ".wav") ? "audio/wav" : "application/octet-stream");
+    char cd[300]; snprintf(cd, sizeof(cd), "attachment; filename=\"%s\"", bn);
+    httpd_resp_set_hdr(req, "Content-Disposition", cd);
+    char *buf = malloc(4096);
+    if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
+    size_t r; esp_err_t res = ESP_OK;
+    while ((r = fread(buf, 1, 4096, f)) > 0) {
+        if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) { res = ESP_FAIL; break; }
+    }
+    free(buf); fclose(f);
+    if (res == ESP_OK) httpd_resp_send_chunk(req, NULL, 0);
+    return res;
+}
+
+static esp_err_t delete_handler(httpd_req_t *req) {
+    char q[224], path[160] = "", v[160];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
+        httpd_query_key_value(q, "path", v, sizeof(v)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no path"); return ESP_FAIL;
+    }
+    url_decode(path, v, sizeof(path));
+    if (!sd_path_ok(path)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_FAIL; }
+    if (unlink(path) != 0) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "delete failed"); return ESP_FAIL; }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
 static esp_err_t init_sd_card(void) {
     return mount_sd_card(false);
 }
@@ -437,7 +838,7 @@ static esp_err_t init_sd_card(void) {
 static esp_err_t mount_sd_card(bool format_if_mount_failed) {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = format_if_mount_failed,
-        .max_files = 4,
+        .max_files = 8,
         .allocation_unit_size = 16 * 1024,
     };
 
@@ -775,6 +1176,7 @@ static esp_err_t control_handler(httpd_req_t *req) {
             return ESP_FAIL;
         }
         err = s->set_framesize(s, fs);
+        if (err == ESP_OK) cam_setting_save("framesize", fs);
     }
     if (err == ESP_OK && httpd_query_key_value(query, "quality", value, sizeof(value)) == ESP_OK) {
         int quality = atoi(value);
@@ -783,6 +1185,7 @@ static esp_err_t control_handler(httpd_req_t *req) {
             return ESP_FAIL;
         }
         err = s->set_quality(s, quality);
+        if (err == ESP_OK) cam_setting_save("quality", quality);
     }
     if (err == ESP_OK && httpd_query_key_value(query, "brightness", value, sizeof(value)) == ESP_OK) {
         int level = atoi(value);
@@ -791,6 +1194,7 @@ static esp_err_t control_handler(httpd_req_t *req) {
             return ESP_FAIL;
         }
         err = s->set_brightness(s, level);
+        if (err == ESP_OK) cam_setting_save("brightness", level);
     }
     if (err == ESP_OK && httpd_query_key_value(query, "contrast", value, sizeof(value)) == ESP_OK) {
         int level = atoi(value);
@@ -799,6 +1203,7 @@ static esp_err_t control_handler(httpd_req_t *req) {
             return ESP_FAIL;
         }
         err = s->set_contrast(s, level);
+        if (err == ESP_OK) cam_setting_save("contrast", level);
     }
     if (err == ESP_OK && httpd_query_key_value(query, "saturation", value, sizeof(value)) == ESP_OK) {
         int level = atoi(value);
@@ -807,12 +1212,17 @@ static esp_err_t control_handler(httpd_req_t *req) {
             return ESP_FAIL;
         }
         err = s->set_saturation(s, level);
+        if (err == ESP_OK) cam_setting_save("saturation", level);
     }
     if (err == ESP_OK && httpd_query_key_value(query, "hmirror", value, sizeof(value)) == ESP_OK) {
-        err = s->set_hmirror(s, atoi(value) ? 1 : 0);
+        int on = atoi(value) ? 1 : 0;
+        err = s->set_hmirror(s, on);
+        if (err == ESP_OK) cam_setting_save("hmirror", on);
     }
     if (err == ESP_OK && httpd_query_key_value(query, "vflip", value, sizeof(value)) == ESP_OK) {
-        err = s->set_vflip(s, atoi(value) ? 1 : 0);
+        int on = atoi(value) ? 1 : 0;
+        err = s->set_vflip(s, on);
+        if (err == ESP_OK) cam_setting_save("vflip", on);
     }
 
     if (err != ESP_OK) {
@@ -968,7 +1378,22 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "</div>"
         "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden'><div id='otabar' style='height:100%;width:0;background:var(--accent);transition:width .2s'></div></div>"
         "<div class='meta'><span id='otaState'>Select a .bin and flash. The board reboots into it automatically.</span></div>"
-        "</section></main><script>");
+        "</section>"
+        "<section class='card'><h3>Recording (loop to SD)</h3>"
+        "<div class='toolbar' style='margin:0 0 10px'>"
+        "<button class='btn primary' id='recBtn' type='button'>Start recording</button>"
+        "<label class='btn' style='cursor:pointer;gap:10px'>Audio<input id='recAudio' type='checkbox' style='width:18px;height:18px'></label>"
+        "</div>"
+        "<div class='ctl'><div class='row'><label for='recPct'>Disk budget</label><span class='val' id='recPctV'>80%</span></div><input id='recPct' type='range' min='10' max='95' value='80'></div>"
+        "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden;margin:10px 0'><div id='recBar' style='height:100%;width:0;background:var(--accent);transition:width .3s'></div></div>"
+        "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
+        "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
+        "</section>"
+        "<section class='card'><h3>SD Files</h3>"
+        "<div class='meta' style='margin:0 0 10px'><span id='fbPath'>/sdcard</span><button class='btn' id='fbUp' type='button' style='flex:0;min-width:70px;height:32px'>Up</button></div>"
+        "<div id='fbList' style='display:flex;flex-direction:column;gap:6px'></div>"
+        "</section>"
+        "</main><script>");
 
     if (camera_ready) {
         httpd_resp_sendstr_chunk(req,
@@ -989,6 +1414,25 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "const _r=document.getElementById('reboot');if(_r)_r.onclick=()=>{if(confirm('Reboot board?'))fetch('/reboot');};"
         "const _rec=document.getElementById('rec');if(_rec)_rec.onclick=async()=>{const st=document.getElementById('micState'),pl=document.getElementById('player');_rec.disabled=true;const t0=st.textContent;st.textContent='Recording 5s...';try{const r=await fetch('/audio.wav?secs=5');const b=await r.blob();pl.src=URL.createObjectURL(b);pl.play().catch(()=>{});st.textContent='Captured '+(b.size>>10)+' KB';}catch(e){st.textContent='Record failed';}_rec.disabled=false;setTimeout(()=>{st.textContent=t0;},4000);};"
         "const _fl=document.getElementById('flash');if(_fl)_fl.onclick=()=>{const f=document.getElementById('fw').files[0],st=document.getElementById('otaState'),bar=document.getElementById('otabar');if(!f){st.textContent='Pick a .bin first';return;}if(!confirm('Flash '+f.name+' ('+(f.size>>10)+' KB) over WiFi?'))return;_fl.disabled=true;const x=new XMLHttpRequest();x.open('POST','/ota');x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);bar.style.width=p+'%';st.textContent='Uploading '+p+'%';}};x.onload=()=>{st.textContent=x.status===200?'Flashed. Rebooting... reload in ~10s.':'OTA failed: '+x.responseText;if(x.status===200){bar.style.width='100%';setTimeout(()=>location.reload(),12000);}else _fl.disabled=false;};x.onerror=()=>{st.textContent='Upload error';_fl.disabled=false;};x.send(f);};"
+        /* Recording controls */
+        "const recBtn=document.getElementById('recBtn'),recPct=document.getElementById('recPct');"
+        "async function recRefresh(){try{const d=await (await fetch('/rec/list')).json();"
+        "recBtn.textContent=d.enabled?'Stop recording':'Start recording';recBtn.classList.toggle('danger',d.enabled);"
+        "document.getElementById('recState').textContent=d.status;document.getElementById('recAudio').checked=d.audio;"
+        "const budget=d.total*d.pct/100;document.getElementById('recBar').style.width=Math.min(100,budget?d.used/budget*100:0)+'%';"
+        "document.getElementById('recUse').textContent=((d.used/1048576)|0)+' MB / '+((budget/1048576)|0)+' MB';"
+        "if(document.activeElement!==recPct){recPct.value=d.pct;document.getElementById('recPctV').textContent=d.pct+'%';}"
+        "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML=\"<span>\"+cl.name+' ('+((cl.size/1048576)|0)+' MB)</span>';const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);c.appendChild(r);});}catch(e){}}"
+        "recBtn.onclick=async()=>{await fetch('/rec?on='+(recBtn.textContent.startsWith('Start')?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
+        "document.getElementById('recAudio').onchange=async e=>{await fetch('/rec?audio='+(e.target.checked?1:0),{method:'POST'});};"
+        "recPct.addEventListener('input',()=>document.getElementById('recPctV').textContent=recPct.value+'%');"
+        "recPct.addEventListener('change',()=>fetch('/rec?pct='+recPct.value,{method:'POST'}));"
+        "setInterval(recRefresh,3000);recRefresh();"
+        /* SD file browser */
+        "let fbCur='/sdcard';"
+        "async function fbLoad(p){try{const r=await fetch('/files?dir='+encodeURIComponent(p));if(!r.ok)return;const d=await r.json();fbCur=d.dir;document.getElementById('fbPath').textContent=d.dir;const l=document.getElementById('fbList');l.innerHTML='';d.entries.sort((a,b)=>(b.dir-a.dir)||a.name.localeCompare(b.name)).forEach(en=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';const s=document.createElement('span');s.textContent=(en.dir?'[dir] ':'')+en.name+(en.dir?'':' ('+((en.size/1024)|0)+' KB)');if(en.dir){s.style.cursor='pointer';s.onclick=()=>fbLoad(d.dir+'/'+en.name);}row.appendChild(s);if(!en.dir){const w=document.createElement('span');const g=document.createElement('a');g.className='btn';g.style.cssText='flex:0;min-width:70px;height:30px';g.textContent='Get';g.href='/download?path='+encodeURIComponent(d.dir+'/'+en.name);const del=document.createElement('button');del.className='btn danger';del.type='button';del.style.cssText='flex:0;min-width:64px;height:30px;margin-left:6px';del.textContent='Del';del.onclick=async()=>{if(confirm('Delete '+en.name+'?')){await fetch('/delete?path='+encodeURIComponent(d.dir+'/'+en.name),{method:'POST'});fbLoad(fbCur);}};w.appendChild(g);w.appendChild(del);row.appendChild(w);}l.appendChild(row);});}catch(e){}}"
+        "document.getElementById('fbUp').onclick=()=>{if(fbCur!=='/sdcard')fbLoad(fbCur.substring(0,fbCur.lastIndexOf('/'))||'/sdcard');};"
+        "fbLoad('/sdcard');"
         "</script></body></html>");
     return httpd_resp_sendstr_chunk(req, NULL);
 }
@@ -1042,6 +1486,12 @@ static httpd_uri_t uri_ota = {
     .user_ctx = NULL
 };
 
+static httpd_uri_t uri_rec        = { .uri = "/rec",       .method = HTTP_POST, .handler = rec_toggle_handler, .user_ctx = NULL };
+static httpd_uri_t uri_rec_list   = { .uri = "/rec/list",  .method = HTTP_GET,  .handler = rec_list_handler,   .user_ctx = NULL };
+static httpd_uri_t uri_files      = { .uri = "/files",     .method = HTTP_GET,  .handler = files_list_handler, .user_ctx = NULL };
+static httpd_uri_t uri_download   = { .uri = "/download",  .method = HTTP_GET,  .handler = download_handler,   .user_ctx = NULL };
+static httpd_uri_t uri_delete     = { .uri = "/delete",    .method = HTTP_POST, .handler = delete_handler,     .user_ctx = NULL };
+
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 12;
@@ -1063,6 +1513,11 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_format_sd);
         httpd_register_uri_handler(server, &uri_audio);
         httpd_register_uri_handler(server, &uri_ota);
+        httpd_register_uri_handler(server, &uri_rec);
+        httpd_register_uri_handler(server, &uri_rec_list);
+        httpd_register_uri_handler(server, &uri_files);
+        httpd_register_uri_handler(server, &uri_download);
+        httpd_register_uri_handler(server, &uri_delete);
         ESP_LOGI(TAG, "HTTP server started");
     }
     return server;
@@ -1524,12 +1979,16 @@ void app_main(void) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Continuing without camera; WiFi and web UI will still start");
     }
+    mic_lock = xSemaphoreCreateMutex();
     if (init_mic() != ESP_OK) {
         ESP_LOGW(TAG, "Continuing without microphone");
     }
     init_sd_card();
+    rec_cfg_load();
     wifi_init_sta();
     init_mdns();
     start_webserver();
     start_stream_webserver();
+    /* Loop recorder runs continuously; it idles until enabled via the web UI. */
+    xTaskCreate(rec_task, "rec_task", 6144, NULL, 4, NULL);
 }
