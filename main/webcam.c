@@ -49,6 +49,7 @@ static void init_mdns(void);
 static esp_err_t init_mic(void);
 static esp_err_t audio_handler(httpd_req_t *req);
 static esp_err_t ota_handler(httpd_req_t *req);
+static esp_err_t config_backup_handler(httpd_req_t *req);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
@@ -131,6 +132,9 @@ static SemaphoreHandle_t mic_lock;   /* only one mic consumer (rec vs /audio.wav
 /* Camera settings persistence */
 #define NVS_CAM_NAMESPACE "cam_cfg"
 
+/* Portable config on SD (incl. WiFi creds) — drop-in provisioning + backup */
+#define SD_CONFIG_PATH "/sdcard/xiao-config.txt"
+
 /* Loop (dashcam) recording to SD */
 #define REC_DIR            "/sdcard/rec"
 #define REC_NVS_NS         "rec_cfg"
@@ -206,6 +210,49 @@ static esp_err_t wifi_credentials_save(const char *ssid, const char *pass) {
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
     return err;
+}
+
+/* Write a portable config (incl. WiFi creds) to the SD card. */
+static void sd_config_save(const char *ssid, const char *pass) {
+    if (!sd_ready) return;
+    FILE *f = fopen(SD_CONFIG_PATH, "w");
+    if (!f) {
+        ESP_LOGW(TAG, "Could not write %s", SD_CONFIG_PATH);
+        return;
+    }
+    fprintf(f, "# XIAO ESP32S3 camera config\n");
+    fprintf(f, "# Drop this SD card into a fresh board to auto-provision WiFi.\n");
+    fprintf(f, "ssid=%s\n", ssid);
+    fprintf(f, "pass=%s\n", pass);
+    fprintf(f, "rec_pct=%d\n", rec_budget_pct);
+    fprintf(f, "rec_audio=%d\n", rec_audio ? 1 : 0);
+    fclose(f);
+    ESP_LOGI(TAG, "Config written to %s", SD_CONFIG_PATH);
+}
+
+/* Read config from SD. Returns true if a usable SSID was found; also applies
+   any recording settings present. */
+static bool sd_config_load(char *ssid, size_t sl, char *pass, size_t pl) {
+    FILE *f = fopen(SD_CONFIG_PATH, "r");
+    if (!f) return false;
+    ssid[0] = '\0';
+    pass[0] = '\0';
+    char line[160];
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = '\0';
+        if (line[0] == '#' || line[0] == '\0') continue;
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char *k = line, *v = eq + 1;
+        if (strcmp(k, "ssid") == 0)            strlcpy(ssid, v, sl);
+        else if (strcmp(k, "pass") == 0)       strlcpy(pass, v, pl);
+        else if (strcmp(k, "rec_pct") == 0)    { int p = atoi(v); if (p >= 10 && p <= 95) rec_budget_pct = p; }
+        else if (strcmp(k, "rec_audio") == 0)  rec_audio = atoi(v) ? true : false;
+    }
+    fclose(f);
+    return strlen(ssid) > 0 && wifi_password_is_valid(pass);
 }
 
 /* Persist one camera setting (framesize, hmirror, vflip, ...) to NVS. */
@@ -831,6 +878,19 @@ static esp_err_t delete_handler(httpd_req_t *req) {
     return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
 
+/* Back up the current config (incl. WiFi creds from NVS) to the SD card. */
+static esp_err_t config_backup_handler(httpd_req_t *req) {
+    if (!sd_ready) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No SD card mounted"); return ESP_FAIL; }
+    char ssid[32] = {0}, pass[64] = {0};
+    if (wifi_credentials_load(ssid, sizeof(ssid), pass, sizeof(pass)) != ESP_OK || !ssid[0]) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No saved WiFi to back up");
+        return ESP_FAIL;
+    }
+    sd_config_save(ssid, pass);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "Config saved to " SD_CONFIG_PATH);
+}
+
 static esp_err_t init_sd_card(void) {
     return mount_sd_card(false);
 }
@@ -915,9 +975,15 @@ static void wifi_init_sta(void) {
     char pass[64] = {0};
 
     if (wifi_credentials_load(ssid, sizeof(ssid), pass, sizeof(pass)) != ESP_OK || strlen(ssid) == 0) {
-        ESP_LOGW(TAG, "No WiFi credentials in NVS, starting provisioning mode");
-        wifi_init_prov();
-        return;
+        /* Before provisioning, try a config file on the SD card (drop-in setup). */
+        if (sd_config_load(ssid, sizeof(ssid), pass, sizeof(pass))) {
+            ESP_LOGI(TAG, "Loaded WiFi credentials from SD (%s); persisting to NVS", SD_CONFIG_PATH);
+            wifi_credentials_save(ssid, pass);
+        } else {
+            ESP_LOGW(TAG, "No WiFi credentials in NVS or SD, starting provisioning mode");
+            wifi_init_prov();
+            return;
+        }
     }
 
     wifi_event_group = xEventGroupCreate();
@@ -1390,6 +1456,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
         "</section>"
         "<section class='card'><h3>SD Files</h3>"
+        "<div class='toolbar' style='margin:0 0 10px'><button class='btn' id='cfgBackup' type='button'>Backup config to SD</button></div>"
+        "<div class='meta' style='margin:0 0 10px'><span id='cfgState'>Config (incl. WiFi) can be saved to SD and auto-loaded on a fresh board.</span></div>"
         "<div class='meta' style='margin:0 0 10px'><span id='fbPath'>/sdcard</span><button class='btn' id='fbUp' type='button' style='flex:0;min-width:70px;height:32px'>Up</button></div>"
         "<div id='fbList' style='display:flex;flex-direction:column;gap:6px'></div>"
         "</section>"
@@ -1432,6 +1500,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "let fbCur='/sdcard';"
         "async function fbLoad(p){try{const r=await fetch('/files?dir='+encodeURIComponent(p));if(!r.ok)return;const d=await r.json();fbCur=d.dir;document.getElementById('fbPath').textContent=d.dir;const l=document.getElementById('fbList');l.innerHTML='';d.entries.sort((a,b)=>(b.dir-a.dir)||a.name.localeCompare(b.name)).forEach(en=>{const row=document.createElement('div');row.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';const s=document.createElement('span');s.textContent=(en.dir?'[dir] ':'')+en.name+(en.dir?'':' ('+((en.size/1024)|0)+' KB)');if(en.dir){s.style.cursor='pointer';s.onclick=()=>fbLoad(d.dir+'/'+en.name);}row.appendChild(s);if(!en.dir){const w=document.createElement('span');const g=document.createElement('a');g.className='btn';g.style.cssText='flex:0;min-width:70px;height:30px';g.textContent='Get';g.href='/download?path='+encodeURIComponent(d.dir+'/'+en.name);const del=document.createElement('button');del.className='btn danger';del.type='button';del.style.cssText='flex:0;min-width:64px;height:30px;margin-left:6px';del.textContent='Del';del.onclick=async()=>{if(confirm('Delete '+en.name+'?')){await fetch('/delete?path='+encodeURIComponent(d.dir+'/'+en.name),{method:'POST'});fbLoad(fbCur);}};w.appendChild(g);w.appendChild(del);row.appendChild(w);}l.appendChild(row);});}catch(e){}}"
         "document.getElementById('fbUp').onclick=()=>{if(fbCur!=='/sdcard')fbLoad(fbCur.substring(0,fbCur.lastIndexOf('/'))||'/sdcard');};"
+        "document.getElementById('cfgBackup').onclick=async()=>{const st=document.getElementById('cfgState');st.textContent='Saving...';try{const r=await fetch('/config/backup',{method:'POST'});st.textContent=await r.text();fbLoad(fbCur);}catch(e){st.textContent='Backup failed';}};"
         "fbLoad('/sdcard');"
         "</script></body></html>");
     return httpd_resp_sendstr_chunk(req, NULL);
@@ -1491,10 +1560,11 @@ static httpd_uri_t uri_rec_list   = { .uri = "/rec/list",  .method = HTTP_GET,  
 static httpd_uri_t uri_files      = { .uri = "/files",     .method = HTTP_GET,  .handler = files_list_handler, .user_ctx = NULL };
 static httpd_uri_t uri_download   = { .uri = "/download",  .method = HTTP_GET,  .handler = download_handler,   .user_ctx = NULL };
 static httpd_uri_t uri_delete     = { .uri = "/delete",    .method = HTTP_POST, .handler = delete_handler,     .user_ctx = NULL };
+static httpd_uri_t uri_cfg_backup = { .uri = "/config/backup", .method = HTTP_POST, .handler = config_backup_handler, .user_ctx = NULL };
 
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;
     config.max_resp_headers = 8;
     /* index_handler builds sizable HTML on-stack; 4 KB default is too tight. */
     config.stack_size = 8192;
@@ -1518,6 +1588,7 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_files);
         httpd_register_uri_handler(server, &uri_download);
         httpd_register_uri_handler(server, &uri_delete);
+        httpd_register_uri_handler(server, &uri_cfg_backup);
         ESP_LOGI(TAG, "HTTP server started");
     }
     return server;
@@ -1750,6 +1821,7 @@ static esp_err_t prov_save_handler(httpd_req_t *req) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS save failed");
         return ESP_FAIL;
     }
+    sd_config_save(ssid, pass);   /* mirror to SD so the config is portable */
 
     const char *resp = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
                        "<title>Saved</title></head><body style='font-family:sans-serif;"
