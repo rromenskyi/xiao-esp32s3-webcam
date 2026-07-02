@@ -160,11 +160,11 @@ static SemaphoreHandle_t mic_lock;   /* only one mic consumer (rec vs /audio.wav
 #define REC_DIR            "/sdcard/rec"
 #define REC_NVS_NS         "rec_cfg"
 #define REC_TARGET_FPS     10
-#define REC_SEG_MAX_BYTES  (16u * 1024 * 1024)
-#define REC_SEG_MAX_FRAMES 2400
+#define REC_SEG_HARD_BYTES (1024u * 1024 * 1024)  /* safety cap so a clip never runs away */
 static volatile bool rec_enabled;
 static bool rec_audio = true;              /* mux audio into clips when mic is present */
 static int  rec_budget_pct = 80;           /* keep total clips under this % of the card */
+static int  rec_seg_min = 15;              /* rotate to a new clip every N minutes (configurable) */
 static char rec_status[96] = "idle";
 
 static camera_config_t camera_config = {
@@ -277,6 +277,7 @@ static void sd_config_save_all(void) {
     }
     fprintf(f, "rec_pct=%d\n", rec_budget_pct);
     fprintf(f, "rec_audio=%d\n", rec_audio ? 1 : 0);
+    fprintf(f, "rec_segmin=%d\n", rec_seg_min);
     fclose(f);
     ESP_LOGI(TAG, "Config written to %s (%d networks)", SD_CONFIG_PATH, wifi_cred_count);
 }
@@ -304,6 +305,7 @@ static bool sd_config_load(void) {
             cur_ssid[0] = '\0';
         } else if (strcmp(k, "rec_pct") == 0)   { int p = atoi(v); if (p >= 10 && p <= 95) rec_budget_pct = p; }
         else if (strcmp(k, "rec_audio") == 0)   rec_audio = atoi(v) ? true : false;
+        else if (strcmp(k, "rec_segmin") == 0)  { int m = atoi(v); if (m >= 1 && m <= 60) rec_seg_min = m; }
     }
     if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }
     fclose(f);
@@ -599,6 +601,7 @@ static void rec_cfg_load(void) {
     if (nvs_get_i32(h, "pct", &v) == ESP_OK && v >= 10 && v <= 95) rec_budget_pct = v;
     if (nvs_get_i32(h, "audio", &v) == ESP_OK) rec_audio = v ? true : false;
     if (nvs_get_i32(h, "on", &v) == ESP_OK) rec_enabled = v ? true : false;  /* auto-resume loop after power-up */
+    if (nvs_get_i32(h, "segmin", &v) == ESP_OK && v >= 1 && v <= 60) rec_seg_min = v;
     nvs_close(h);
 }
 static void rec_cfg_save(void) {
@@ -607,6 +610,7 @@ static void rec_cfg_save(void) {
     nvs_set_i32(h, "pct", rec_budget_pct);
     nvs_set_i32(h, "audio", rec_audio ? 1 : 0);
     nvs_set_i32(h, "on", rec_enabled ? 1 : 0);
+    nvs_set_i32(h, "segmin", rec_seg_min);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -813,7 +817,8 @@ static void rec_task(void *arg) {
 
         snprintf(rec_status, sizeof(rec_status), "REC %s (%u frames%s)", cur,
                  (unsigned)w.vframes, have_mic ? "+audio" : "");
-        if (w.movi_bytes >= REC_SEG_MAX_BYTES || w.vframes >= REC_SEG_MAX_FRAMES) {
+        uint32_t seg_frames = (uint32_t)rec_seg_min * 60 * REC_TARGET_FPS;
+        if (w.vframes >= seg_frames || w.movi_bytes >= REC_SEG_HARD_BYTES) {
             avi_end(&w); open = false; rec_enforce_budget();
         }
     }
@@ -825,10 +830,11 @@ static esp_err_t rec_toggle_handler(httpd_req_t *req) {
         if (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK) { rec_enabled = atoi(v) ? true : false; rec_cfg_save(); }
         if (httpd_query_key_value(q, "pct", v, sizeof(v)) == ESP_OK) { int p = atoi(v); if (p >= 10 && p <= 95) { rec_budget_pct = p; rec_cfg_save(); } }
         if (httpd_query_key_value(q, "audio", v, sizeof(v)) == ESP_OK) { rec_audio = atoi(v) ? true : false; rec_cfg_save(); }
+        if (httpd_query_key_value(q, "seg", v, sizeof(v)) == ESP_OK) { int m = atoi(v); if (m >= 1 && m <= 60) { rec_seg_min = m; rec_cfg_save(); } }
     }
-    char body[128];
-    snprintf(body, sizeof(body), "{\"enabled\":%s,\"audio\":%s,\"pct\":%d}",
-             rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct);
+    char body[160];
+    snprintf(body, sizeof(body), "{\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d}",
+             rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct, rec_seg_min);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
 }
@@ -854,9 +860,9 @@ static esp_err_t rec_list_handler(httpd_req_t *req) {
         }
         closedir(d);
     }
-    char tail[224];
-    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"used\":%llu,\"total\":%llu,\"status\":\"%s\"}",
-             rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct,
+    char tail[256];
+    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"used\":%llu,\"total\":%llu,\"status\":\"%s\"}",
+             rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct, rec_seg_min,
              (unsigned long long)used, (unsigned long long)total, rec_status);
     httpd_resp_sendstr_chunk(req, tail);
     return httpd_resp_sendstr_chunk(req, NULL);
@@ -1582,6 +1588,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<label class='btn' style='cursor:pointer;gap:10px'>Audio<input id='recAudio' type='checkbox' style='width:18px;height:18px'></label>"
         "</div>"
         "<div class='ctl'><div class='row'><label for='recPct'>Disk budget</label><span class='val' id='recPctV'>80%</span></div><input id='recPct' type='range' min='10' max='95' value='80'></div>"
+        "<div class='ctl'><div class='row'><label for='recSeg'>Clip length</label><span class='val' id='recSegV'>15 min</span></div><input id='recSeg' type='range' min='1' max='60' value='15'></div>"
         "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden;margin:10px 0'><div id='recBar' style='height:100%;width:0;background:var(--accent);transition:width .3s'></div></div>"
         "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
         "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
@@ -1630,11 +1637,14 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "const budget=d.total*d.pct/100;document.getElementById('recBar').style.width=Math.min(100,budget?d.used/budget*100:0)+'%';"
         "document.getElementById('recUse').textContent=((d.used/1048576)|0)+' MB / '+((budget/1048576)|0)+' MB';"
         "if(document.activeElement!==recPct){recPct.value=d.pct;document.getElementById('recPctV').textContent=d.pct+'%';}"
+        "var _rs=document.getElementById('recSeg');if(document.activeElement!==_rs){_rs.value=d.seg;document.getElementById('recSegV').textContent=d.seg+' min';}"
         "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML=\"<span>\"+cl.name+' ('+((cl.size/1048576)|0)+' MB)</span>';const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);c.appendChild(r);});}catch(e){}}"
         "recBtn.onclick=async()=>{await fetch('/rec?on='+(recBtn.textContent.startsWith('Start')?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "document.getElementById('recAudio').onchange=async e=>{await fetch('/rec?audio='+(e.target.checked?1:0),{method:'POST'});};"
         "recPct.addEventListener('input',()=>document.getElementById('recPctV').textContent=recPct.value+'%');"
         "recPct.addEventListener('change',()=>fetch('/rec?pct='+recPct.value,{method:'POST'}));"
+        "var recSeg=document.getElementById('recSeg');recSeg.addEventListener('input',()=>document.getElementById('recSegV').textContent=recSeg.value+' min');"
+        "recSeg.addEventListener('change',()=>fetch('/rec?seg='+recSeg.value,{method:'POST'}));"
         "setInterval(recRefresh,3000);recRefresh();"
         /* SD file browser */
         "let fbCur='/sdcard';"
