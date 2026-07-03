@@ -70,6 +70,7 @@ static esp_err_t wifi_del_handler(httpd_req_t *req);
 static esp_err_t time_handler(httpd_req_t *req);
 static esp_err_t ntp_handler(httpd_req_t *req);
 static esp_err_t sysinfo_handler(httpd_req_t *req);
+static esp_err_t mask_handler(httpd_req_t *req);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
@@ -188,6 +189,10 @@ static int  motion_sens = 5;               /* % of pixels changed to count as mo
 static volatile bool motion_active = false;
 static volatile int  motion_last_score = -1;   /* last measured motion %, -1 = not measured yet */
 #define MOTION_PIX_THRESH 18               /* per-pixel luma delta that counts as changed */
+/* Ignore-mask over an 8x6 grid ('1' = ignore that cell, e.g. a window/curtain). */
+#define MASK_COLS 8
+#define MASK_ROWS 6
+static char motion_mask[MASK_COLS * MASK_ROWS + 1] = "000000000000000000000000000000000000000000000000";
 
 /* NTP time sync (opt-in; off by default). When synced, clips are named by time. */
 #define SYS_NVS_NS "sys_cfg"
@@ -310,6 +315,9 @@ static void sd_config_save_all(void) {
     fprintf(f, "rec_segmin=%d\n", rec_seg_min);
     fprintf(f, "ntp=%d\n", ntp_enabled ? 1 : 0);
     fprintf(f, "tz=%s\n", ntp_tz);
+    fprintf(f, "motion=%d\n", motion_enabled ? 1 : 0);
+    fprintf(f, "msens=%d\n", motion_sens);
+    fprintf(f, "mask=%s\n", motion_mask);
     fclose(f);
     ESP_LOGI(TAG, "Config written to %s (%d networks)", SD_CONFIG_PATH, wifi_cred_count);
 }
@@ -340,6 +348,9 @@ static bool sd_config_load(void) {
         else if (strcmp(k, "rec_segmin") == 0)  { int m = atoi(v); if (m >= 1 && m <= 60) rec_seg_min = m; }
         else if (strcmp(k, "ntp") == 0)         ntp_enabled = atoi(v) ? true : false;
         else if (strcmp(k, "tz") == 0)          strlcpy(ntp_tz, v, sizeof(ntp_tz));
+        else if (strcmp(k, "motion") == 0)      motion_enabled = atoi(v) ? true : false;
+        else if (strcmp(k, "msens") == 0)       { int s = atoi(v); if (s >= 1 && s <= 30) motion_sens = s; }
+        else if (strcmp(k, "mask") == 0)        { if (strlen(v) == MASK_COLS * MASK_ROWS) strlcpy(motion_mask, v, sizeof(motion_mask)); }
     }
     if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }
     fclose(f);
@@ -659,6 +670,8 @@ static void sys_cfg_load(void) {
     nvs_get_str(h, "tz", ntp_tz, &tl);
     if (nvs_get_i32(h, "motion", &v) == ESP_OK) motion_enabled = v ? true : false;
     if (nvs_get_i32(h, "msens", &v) == ESP_OK && v >= 1 && v <= 30) motion_sens = v;
+    size_t ml = sizeof(motion_mask);
+    nvs_get_str(h, "mask", motion_mask, &ml);
     nvs_close(h);
 }
 static void sys_cfg_save(void) {
@@ -668,6 +681,7 @@ static void sys_cfg_save(void) {
     nvs_set_str(h, "tz", ntp_tz);
     nvs_set_i32(h, "motion", motion_enabled ? 1 : 0);
     nvs_set_i32(h, "msens", motion_sens);
+    nvs_set_str(h, "mask", motion_mask);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -893,14 +907,18 @@ static int motion_score(camera_fb_t *fb) {
         for (size_t i = 0; i < npix; i++) motion_bg[i] = rgb565_luma(px[i]);
         return -1;
     }
-    int changed = 0;
+    int changed = 0, counted = 0;
     for (size_t i = 0; i < npix; i++) {
         uint8_t lum = rgb565_luma(px[i]);
+        motion_bg[i] = (uint8_t)((motion_bg[i] * 7 + lum) / 8);   /* slow adapt (even masked) */
+        int x = i % w, y = i / w;
+        int cell = (y * MASK_ROWS / h) * MASK_COLS + (x * MASK_COLS / w);
+        if (motion_mask[cell] == '1') continue;                  /* masked-out region */
         int d = (int)lum - (int)motion_bg[i]; if (d < 0) d = -d;
         if (d > MOTION_PIX_THRESH) changed++;
-        motion_bg[i] = (uint8_t)((motion_bg[i] * 7 + lum) / 8);   /* slow adapt */
+        counted++;
     }
-    return (int)(changed * 100 / npix);
+    return counted > 0 ? (int)(changed * 100 / counted) : 0;
 }
 
 static void rec_task(void *arg) {
@@ -1322,6 +1340,22 @@ static esp_err_t wifi_del_handler(httpd_req_t *req) {
     }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+static esp_err_t mask_handler(httpd_req_t *req) {
+    char q[128], v[64];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "grid", v, sizeof(v)) == ESP_OK) {
+        if (strlen(v) == MASK_COLS * MASK_ROWS) {
+            bool ok = true;
+            for (int i = 0; v[i]; i++) if (v[i] != '0' && v[i] != '1') { ok = false; break; }
+            if (ok) { strlcpy(motion_mask, v, sizeof(motion_mask)); sys_cfg_save(); }
+        }
+    }
+    char body[96];
+    snprintf(body, sizeof(body), "{\"cols\":%d,\"rows\":%d,\"grid\":\"%s\"}", MASK_COLS, MASK_ROWS, motion_mask);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
 }
 
 static esp_err_t time_handler(httpd_req_t *req) {
@@ -1856,6 +1890,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         ".badges{position:absolute;top:12px;left:12px;right:12px;display:flex;justify-content:space-between;pointer-events:none}"
         ".badge{background:rgba(0,0,0,.55);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.14);color:#fff;font-size:12px;font-weight:600;padding:5px 11px;border-radius:999px}"
         ".badge.live{color:var(--accent)}.badge.live::before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:6px;vertical-align:middle;animation:pulse 2s infinite}"
+        ".maskgrid{position:absolute;inset:0;display:grid;grid-template-columns:repeat(8,1fr);grid-template-rows:repeat(6,1fr);z-index:3}.mcell{border:1px solid rgba(255,255,255,.14);cursor:pointer}.mcell.on{background:rgba(229,72,77,.5)}.mcell:hover{background:rgba(255,255,255,.12)}"
         ".offline{aspect-ratio:4/3;display:grid;place-content:center;text-align:center;color:var(--muted);padding:24px;gap:6px}.offline h2{margin:0;color:var(--text);font-size:20px}.offline p{margin:0}"
         ".toolbar{display:flex;gap:10px;margin:14px 0;flex-wrap:wrap}"
         ".btn{flex:1;min-width:120px;height:44px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text);font-weight:600;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;transition:.15s}"
@@ -1884,7 +1919,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         httpd_resp_sendstr_chunk(req,
             "<div class='frame'><div class='badges'><span class='badge live'>LIVE</span>"
             "<span class='badge' id='res'>VGA 640×480</span></div>"
-            "<img id='cam' crossorigin='anonymous' alt='Camera stream'></div>"
+            "<img id='cam' crossorigin='anonymous' alt='Camera stream'>"
+            "<div class='maskgrid' id='maskgrid' style='display:none'></div></div>"
             "<div class='toolbar'>"
             "<button class='btn primary' id='snap' type='button'>Snapshot</button>"
             "<button class='btn' id='full' type='button'>Fullscreen</button>"
@@ -1965,6 +2001,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<div class='ctl'><div class='row'><label for='recSeg'>Clip length</label><span class='val' id='recSegV'>15 min</span></div><input id='recSeg' type='range' min='1' max='60' value='15'></div>"
         "<div class='ctl switch'><label for='recMotion'>Record on motion only</label><label class='tgl'><input id='recMotion' type='checkbox'><span class='sl'></span></label></div>"
         "<div class='ctl'><div class='row'><label for='recMsens'>Motion threshold</label><span class='val' id='recMsensV'>5%</span></div><input id='recMsens' type='range' min='1' max='30' value='5'></div>"
+        "<div class='toolbar' style='margin:0'><button class='btn' id='maskBtn' type='button'>Edit ignore zones</button></div>"
         "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden;margin:10px 0'><div id='recBar' style='height:100%;width:0;background:var(--accent);transition:width .3s'></div></div>"
         "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
         "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
@@ -2051,6 +2088,11 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "document.getElementById('recMotion').onchange=e=>{fetch('/rec?motion='+(e.target.checked?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "var recMsens=document.getElementById('recMsens');recMsens.addEventListener('input',()=>document.getElementById('recMsensV').textContent=recMsens.value+'%');"
         "recMsens.addEventListener('change',()=>fetch('/rec?msens='+recMsens.value,{method:'POST'}));"
+        "var mg=document.getElementById('maskgrid'),mb=document.getElementById('maskBtn');"
+        "if(mg&&mb){let mgrid='0'.repeat(48);"
+        "function mrender(){mg.innerHTML='';for(let i=0;i<mgrid.length;i++){const c=document.createElement('div');c.className='mcell'+(mgrid[i]==='1'?' on':'');c.onclick=async()=>{mgrid=mgrid.substring(0,i)+(mgrid[i]==='1'?'0':'1')+mgrid.substring(i+1);c.classList.toggle('on');await fetch('/mask?grid='+mgrid,{method:'POST'});};mg.appendChild(c);}}"
+        "fetch('/mask').then(r=>r.json()).then(d=>{mgrid=d.grid;mg.style.gridTemplateColumns='repeat('+d.cols+',1fr)';mg.style.gridTemplateRows='repeat('+d.rows+',1fr)';mrender();}).catch(()=>{});"
+        "mb.onclick=()=>{const show=mg.style.display==='none';mg.style.display=show?'grid':'none';mb.textContent=show?'Done editing zones':'Edit ignore zones';if(show)window.scrollTo({top:0,behavior:'smooth'});};}"
         "setInterval(recRefresh,3000);recRefresh();"
         /* SD file browser */
         "let fbCur='/sdcard';"
@@ -2148,6 +2190,8 @@ static httpd_uri_t uri_ntp        = { .uri = "/ntp",       .method = HTTP_POST, 
 static httpd_uri_t uri_rename     = { .uri = "/rename",    .method = HTTP_POST, .handler = rename_handler,   .user_ctx = NULL };
 static httpd_uri_t uri_copy       = { .uri = "/copy",      .method = HTTP_POST, .handler = copy_handler,     .user_ctx = NULL };
 static httpd_uri_t uri_sysinfo    = { .uri = "/sysinfo",   .method = HTTP_GET,  .handler = sysinfo_handler,  .user_ctx = NULL };
+static httpd_uri_t uri_mask_get   = { .uri = "/mask",      .method = HTTP_GET,  .handler = mask_handler,     .user_ctx = NULL };
+static httpd_uri_t uri_mask_post  = { .uri = "/mask",      .method = HTTP_POST, .handler = mask_handler,     .user_ctx = NULL };
 
 static httpd_handle_t start_webserver(void) {
     /* Async download worker pool: keeps big/slow downloads off the main worker. */
@@ -2159,7 +2203,7 @@ static httpd_handle_t start_webserver(void) {
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 22;
+    config.max_uri_handlers = 28;
     config.max_resp_headers = 8;
     /* index_handler builds sizable HTML on-stack; 4 KB default is too tight. */
     config.stack_size = 8192;
@@ -2191,6 +2235,8 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_rename);
         httpd_register_uri_handler(server, &uri_copy);
         httpd_register_uri_handler(server, &uri_sysinfo);
+        httpd_register_uri_handler(server, &uri_mask_get);
+        httpd_register_uri_handler(server, &uri_mask_post);
         ESP_LOGI(TAG, "HTTP server started");
     }
     return server;
