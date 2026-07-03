@@ -179,6 +179,7 @@ static volatile bool rec_enabled;
 static bool rec_audio = true;              /* mux audio into clips when mic is present */
 static int  rec_budget_pct = 80;           /* keep total clips under this % of the card */
 static int  rec_seg_min = 15;              /* rotate to a new clip every N minutes (configurable) */
+static char rec_cur_file[48] = "";         /* name of the clip currently being written */
 
 /* NTP time sync (opt-in; off by default). When synced, clips are named by time. */
 #define SYS_NVS_NS "sys_cfg"
@@ -862,7 +863,7 @@ static void rec_task(void *arg) {
     float dcx = 0, dcy = 0;
     while (1) {
         if (!rec_enabled || !sd_ready || !camera_ready) {
-            if (open) { avi_end(&w); open = false; rec_enforce_budget(); }
+            if (open) { avi_end(&w); open = false; rec_cur_file[0] = '\0'; rec_enforce_budget(); }
             if (have_mic) { xSemaphoreGive(mic_lock); have_mic = false; }
             snprintf(rec_status, sizeof(rec_status), "%s", !sd_ready ? "idle (no SD)" : "idle");
             vTaskDelay(pdMS_TO_TICKS(400));
@@ -880,6 +881,7 @@ static void rec_task(void *arg) {
             const char *bn = strrchr(path, '/'); strlcpy(cur, bn ? bn + 1 : path, sizeof(cur));
             if (avi_begin(&w, path, fb->width, fb->height, REC_TARGET_FPS, have_mic, MIC_SAMPLE_RATE)) {
                 open = true;
+                strlcpy(rec_cur_file, cur, sizeof(rec_cur_file));
             } else {
                 esp_camera_fb_return(fb);
                 snprintf(rec_status, sizeof(rec_status), "error: cannot create clip");
@@ -915,7 +917,7 @@ static void rec_task(void *arg) {
         if (w.vframes % (REC_TARGET_FPS * 2) == 0) avi_checkpoint(&w);
         uint32_t seg_frames = (uint32_t)rec_seg_min * 60 * REC_TARGET_FPS;
         if (w.vframes >= seg_frames || w.movi_bytes >= REC_SEG_HARD_BYTES) {
-            avi_end(&w); open = false; rec_enforce_budget();
+            avi_end(&w); open = false; rec_cur_file[0] = '\0'; rec_enforce_budget();
         }
     }
 }
@@ -959,10 +961,10 @@ static esp_err_t rec_list_handler(httpd_req_t *req) {
         }
         closedir(d);
     }
-    char tail[256];
-    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"used\":%llu,\"total\":%llu,\"status\":\"%s\"}",
+    char tail[320];
+    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"used\":%llu,\"total\":%llu,\"active\":\"%s\",\"status\":\"%s\"}",
              rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct, rec_seg_min,
-             (unsigned long long)used, (unsigned long long)total, rec_status);
+             (unsigned long long)used, (unsigned long long)total, rec_cur_file, rec_status);
     httpd_resp_sendstr_chunk(req, tail);
     return httpd_resp_sendstr_chunk(req, NULL);
 }
@@ -1929,7 +1931,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "document.getElementById('recUse').textContent=((d.used/1048576)|0)+' MB / '+((budget/1048576)|0)+' MB';"
         "if(document.activeElement!==recPct){recPct.value=d.pct;document.getElementById('recPctV').textContent=d.pct+'%';}"
         "var _rs=document.getElementById('recSeg');if(document.activeElement!==_rs){_rs.value=d.seg;document.getElementById('recSegV').textContent=d.seg+' min';}"
-        "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML=\"<span>\"+cl.name+' ('+((cl.size/1048576)|0)+' MB)'+(cl.mtime?'  ·  '+cl.mtime:'')+'</span>';const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);c.appendChild(r);});}catch(e){}}"
+        "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const live=cl.name===d.active;const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML='<span>'+(live?'● ':'')+cl.name+' ('+((cl.size/1048576)|0)+' MB)'+(cl.mtime?'  ·  '+cl.mtime:'')+(live?'  · recording':'')+'</span>';if(!live){const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);}c.appendChild(r);});}catch(e){}}"
         "recBtn.onclick=async()=>{await fetch('/rec?on='+(recBtn.textContent.startsWith('Start')?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "document.getElementById('recAudio').onchange=async e=>{await fetch('/rec?audio='+(e.target.checked?1:0),{method:'POST'});};"
         "recPct.addEventListener('input',()=>document.getElementById('recPctV').textContent=recPct.value+'%');"
