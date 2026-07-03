@@ -345,6 +345,18 @@ static void sd_config_save_all(void) {
     fprintf(f, "cname=%s\n", cam_name);
     fprintf(f, "tgtok=%s\n", tg_token);
     fprintf(f, "tgchat=%s\n", tg_chat);
+    fprintf(f, "mlc=%d\n", motion_ml ? 1 : 0);
+    fprintf(f, "pconf=%d\n", motion_pconf);
+    sensor_t *cs = esp_camera_sensor_get();
+    if (cs) {
+        fprintf(f, "cam_fs=%d\n", cs->status.framesize);
+        fprintf(f, "cam_q=%d\n", cs->status.quality);
+        fprintf(f, "cam_br=%d\n", cs->status.brightness);
+        fprintf(f, "cam_ct=%d\n", cs->status.contrast);
+        fprintf(f, "cam_sat=%d\n", cs->status.saturation);
+        fprintf(f, "cam_mir=%d\n", cs->status.hmirror);
+        fprintf(f, "cam_flip=%d\n", cs->status.vflip);
+    }
     fclose(f);
     ESP_LOGI(TAG, "Config written to %s (%d networks)", SD_CONFIG_PATH, wifi_cred_count);
 }
@@ -383,6 +395,21 @@ static bool sd_config_load(void) {
         else if (strcmp(k, "cname") == 0)       { if (v[0]) strlcpy(cam_name, v, sizeof(cam_name)); }
         else if (strcmp(k, "tgtok") == 0)       strlcpy(tg_token, v, sizeof(tg_token));
         else if (strcmp(k, "tgchat") == 0)      strlcpy(tg_chat, v, sizeof(tg_chat));
+        else if (strcmp(k, "mlc") == 0)         motion_ml = atoi(v) ? true : false;
+        else if (strcmp(k, "pconf") == 0)       { int p = atoi(v); if (p >= 10 && p <= 90) motion_pconf = p; }
+        else if (strncmp(k, "cam_", 4) == 0) {  /* seed camera look on a fresh board */
+            sensor_t *s = esp_camera_sensor_get();
+            if (s) {
+                int iv = atoi(v);
+                if      (strcmp(k, "cam_fs") == 0)   s->set_framesize(s, (framesize_t)iv);
+                else if (strcmp(k, "cam_q") == 0)    s->set_quality(s, iv);
+                else if (strcmp(k, "cam_br") == 0)   s->set_brightness(s, iv);
+                else if (strcmp(k, "cam_ct") == 0)   s->set_contrast(s, iv);
+                else if (strcmp(k, "cam_sat") == 0)  s->set_saturation(s, iv);
+                else if (strcmp(k, "cam_mir") == 0)  s->set_hmirror(s, iv);
+                else if (strcmp(k, "cam_flip") == 0) s->set_vflip(s, iv);
+            }
+        }
     }
     if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }
     fclose(f);
@@ -3144,6 +3171,7 @@ void app_main(void) {
     wifi_init_sta();          /* may seed settings + networks from an SD config (fresh board) */
     rec_cfg_load();           /* NVS is authoritative — load it AFTER the SD seed so it wins */
     sys_cfg_load();
+    if (camera_ready) { sensor_t *cs = esp_camera_sensor_get(); if (cs) cam_settings_load(cs); }
     if (ml_ready) person_set_thr_pct(motion_pconf);
     ntp_apply();   /* start SNTP if enabled (network is up now) */
     init_mdns();
