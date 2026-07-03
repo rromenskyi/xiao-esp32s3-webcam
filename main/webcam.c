@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "esp_camera.h"
 #include "img_converters.h"
+#include "person_detect.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
@@ -36,12 +37,14 @@
 #include "esp_netif_sntp.h"
 #include "esp_sntp.h"
 #include <time.h>
+#if CONFIG_BT_NIMBLE_ENABLED
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#endif
 #include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -71,6 +74,7 @@ static esp_err_t time_handler(httpd_req_t *req);
 static esp_err_t ntp_handler(httpd_req_t *req);
 static esp_err_t sysinfo_handler(httpd_req_t *req);
 static esp_err_t mask_handler(httpd_req_t *req);
+static esp_err_t detect_handler(httpd_req_t *req);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
@@ -188,6 +192,9 @@ static bool motion_enabled = false;        /* record only while there is motion 
 static int  motion_sens = 5;               /* % of pixels changed to count as motion (1..30) */
 static volatile bool motion_active = false;
 static volatile int  motion_last_score = -1;   /* last measured motion %, -1 = not measured yet */
+static bool motion_ml = true;                  /* confirm motion with the ML person detector */
+static bool ml_ready = false;                  /* person detector loaded ok */
+static int  motion_pconf = 25;                 /* person-confidence % to trigger (10..90) */
 #define MOTION_PIX_THRESH 18               /* per-pixel luma delta that counts as changed */
 /* Ignore-mask over an 8x6 grid ('1' = ignore that cell, e.g. a window/curtain). */
 #define MASK_COLS 8
@@ -670,6 +677,8 @@ static void sys_cfg_load(void) {
     nvs_get_str(h, "tz", ntp_tz, &tl);
     if (nvs_get_i32(h, "motion", &v) == ESP_OK) motion_enabled = v ? true : false;
     if (nvs_get_i32(h, "msens", &v) == ESP_OK && v >= 1 && v <= 30) motion_sens = v;
+    if (nvs_get_i32(h, "mlc", &v) == ESP_OK) motion_ml = v ? true : false;
+    if (nvs_get_i32(h, "pconf", &v) == ESP_OK && v >= 10 && v <= 90) motion_pconf = v;
     size_t ml = sizeof(motion_mask);
     nvs_get_str(h, "mask", motion_mask, &ml);
     nvs_close(h);
@@ -681,6 +690,8 @@ static void sys_cfg_save(void) {
     nvs_set_str(h, "tz", ntp_tz);
     nvs_set_i32(h, "motion", motion_enabled ? 1 : 0);
     nvs_set_i32(h, "msens", motion_sens);
+    nvs_set_i32(h, "mlc", motion_ml ? 1 : 0);
+    nvs_set_i32(h, "pconf", motion_pconf);
     nvs_set_str(h, "mask", motion_mask);
     nvs_commit(h);
     nvs_close(h);
@@ -944,7 +955,15 @@ static void rec_task(void *arg) {
 
         /* Motion gate: when enabled, only record while there is motion (+ tail). */
         if (motion_enabled) {
-            if (++mcheck >= 3) { mcheck = 0; motion_last_score = motion_score(fb); if (motion_last_score >= motion_sens) mcool = REC_TARGET_FPS * 5; }
+            if (++mcheck >= 3) {
+                mcheck = 0;
+                motion_last_score = motion_score(fb);
+                if (motion_last_score >= motion_sens) {
+                    /* Heuristic fired. If ML is on, only record when it's a person. */
+                    bool trigger = (motion_ml && ml_ready) ? (person_in_frame(fb) != 0) : true;
+                    if (trigger) mcool = REC_TARGET_FPS * 5;
+                }
+            }
             if (mcool > 0) { mcool--; motion_active = true; } else motion_active = false;
             if (!motion_active) {
                 if (open) { avi_end(&w); open = false; rec_cur_file[0] = '\0'; rec_enforce_budget(); }
@@ -1011,6 +1030,8 @@ static esp_err_t rec_toggle_handler(httpd_req_t *req) {
         if (httpd_query_key_value(q, "seg", v, sizeof(v)) == ESP_OK) { int m = atoi(v); if (m >= 1 && m <= 60) { rec_seg_min = m; rec_cfg_save(); } }
         if (httpd_query_key_value(q, "motion", v, sizeof(v)) == ESP_OK) { motion_enabled = atoi(v) ? true : false; sys_cfg_save(); }
         if (httpd_query_key_value(q, "msens", v, sizeof(v)) == ESP_OK) { int s = atoi(v); if (s >= 1 && s <= 30) { motion_sens = s; sys_cfg_save(); } }
+        if (httpd_query_key_value(q, "ml", v, sizeof(v)) == ESP_OK) { motion_ml = atoi(v) ? true : false; sys_cfg_save(); }
+        if (httpd_query_key_value(q, "pconf", v, sizeof(v)) == ESP_OK) { int p = atoi(v); if (p >= 10 && p <= 90) { motion_pconf = p; person_set_thr_pct(p); sys_cfg_save(); } }
     }
     char body[200];
     snprintf(body, sizeof(body), "{\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d}",
@@ -1044,10 +1065,11 @@ static esp_err_t rec_list_handler(httpd_req_t *req) {
         }
         closedir(d);
     }
-    char tail[380];
-    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d,\"mactive\":%s,\"mscore\":%d,\"used\":%llu,\"total\":%llu,\"active\":\"%s\",\"status\":\"%s\"}",
+    char tail[500];
+    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d,\"mactive\":%s,\"mscore\":%d,\"ml\":%s,\"mlready\":%s,\"pconf\":%d,\"mlscore\":%d,\"used\":%llu,\"total\":%llu,\"active\":\"%s\",\"status\":\"%s\"}",
              rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct, rec_seg_min,
              motion_enabled ? "true" : "false", motion_sens, motion_active ? "true" : "false", motion_last_score,
+             motion_ml ? "true" : "false", ml_ready ? "true" : "false", motion_pconf, ml_ready ? person_last_score_pct() : -1,
              (unsigned long long)used, (unsigned long long)total, rec_cur_file, rec_status);
     httpd_resp_sendstr_chunk(req, tail);
     return httpd_resp_sendstr_chunk(req, NULL);
@@ -1340,6 +1362,27 @@ static esp_err_t wifi_del_handler(httpd_req_t *req) {
     }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+/* Debug: run the person detector on one live frame and report result + timing. */
+static esp_err_t detect_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    if (!ml_ready || !camera_ready) return httpd_resp_sendstr(req, "{\"ready\":false}");
+    char q[32], v[8];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "fmt", v, sizeof(v)) == ESP_OK) person_set_pixfmt(atoi(v));
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "thr", v, sizeof(v)) == ESP_OK) person_set_thr_pct(atoi(v));
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) return httpd_resp_sendstr(req, "{\"ready\":true,\"error\":\"no frame\"}");
+    int64_t t0 = esp_timer_get_time();
+    int person = person_in_frame(fb);
+    int ms = (int)((esp_timer_get_time() - t0) / 1000);
+    esp_camera_fb_return(fb);
+    char body[160];
+    snprintf(body, sizeof(body), "{\"ready\":true,\"person\":%s,\"score\":%d,\"ms\":%d,\"w\":%d,\"h\":%d}",
+             person ? "true" : "false", person_last_score_pct(), ms, fb->width, fb->height);
+    return httpd_resp_sendstr(req, body);
 }
 
 static esp_err_t mask_handler(httpd_req_t *req) {
@@ -2001,6 +2044,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<div class='ctl'><div class='row'><label for='recSeg'>Clip length</label><span class='val' id='recSegV'>15 min</span></div><input id='recSeg' type='range' min='1' max='60' value='15'></div>"
         "<div class='ctl switch'><label for='recMotion'>Record on motion only</label><label class='tgl'><input id='recMotion' type='checkbox'><span class='sl'></span></label></div>"
         "<div class='ctl'><div class='row'><label for='recMsens'>Motion threshold</label><span class='val' id='recMsensV'>5%</span></div><input id='recMsens' type='range' min='1' max='30' value='5'></div>"
+        "<div class='ctl switch'><label for='recMl'>Confirm with AI (person only)</label><label class='tgl'><input id='recMl' type='checkbox'><span class='sl'></span></label></div>"
+        "<div class='ctl'><div class='row'><label for='recPconf'>AI person confidence</label><span class='val' id='recPconfV'>25%</span></div><input id='recPconf' type='range' min='10' max='90' value='25'></div>"
         "<div class='toolbar' style='margin:0'><button class='btn' id='maskBtn' type='button'>Edit ignore zones</button></div>"
         "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden;margin:10px 0'><div id='recBar' style='height:100%;width:0;background:var(--accent);transition:width .3s'></div></div>"
         "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
@@ -2078,6 +2123,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "if(document.activeElement!==recPct){recPct.value=d.pct;document.getElementById('recPctV').textContent=d.pct+'%';}"
         "var _rs=document.getElementById('recSeg');if(document.activeElement!==_rs){_rs.value=d.seg;document.getElementById('recSegV').textContent=d.seg+' min';}"
         "document.getElementById('recMotion').checked=d.motion;var _ms=document.getElementById('recMsens');if(document.activeElement!==_ms){_ms.value=d.msens;document.getElementById('recMsensV').textContent=d.msens+'%';}"
+        "var _ml=document.getElementById('recMl');_ml.checked=d.ml;_ml.disabled=!d.mlready;_ml.parentElement.style.opacity=d.mlready?'1':'.5';"
+        "var _pc=document.getElementById('recPconf');if(document.activeElement!==_pc){_pc.value=d.pconf;document.getElementById('recPconfV').textContent=d.pconf+'% (now '+(d.mlscore>=0?d.mlscore+'%':'-')+')';}"
         "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const live=cl.name===d.active;const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML='<span>'+(live?'● ':'')+cl.name+' ('+((cl.size/1048576)|0)+' MB)'+(cl.mtime?'  ·  '+cl.mtime:'')+(live?'  · recording':'')+'</span>';if(!live){const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);}c.appendChild(r);});}catch(e){}}"
         "recBtn.onclick=async()=>{await fetch('/rec?on='+(recBtn.textContent.startsWith('Start')?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "document.getElementById('recAudio').onchange=async e=>{await fetch('/rec?audio='+(e.target.checked?1:0),{method:'POST'});};"
@@ -2086,6 +2133,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "var recSeg=document.getElementById('recSeg');recSeg.addEventListener('input',()=>document.getElementById('recSegV').textContent=recSeg.value+' min');"
         "recSeg.addEventListener('change',()=>fetch('/rec?seg='+recSeg.value,{method:'POST'}));"
         "document.getElementById('recMotion').onchange=e=>{fetch('/rec?motion='+(e.target.checked?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
+        "document.getElementById('recMl').onchange=e=>{fetch('/rec?ml='+(e.target.checked?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
+        "var recPconf=document.getElementById('recPconf');recPconf.addEventListener('input',()=>document.getElementById('recPconfV').textContent=recPconf.value+'%');recPconf.addEventListener('change',()=>fetch('/rec?pconf='+recPconf.value,{method:'POST'}));"
         "var recMsens=document.getElementById('recMsens');recMsens.addEventListener('input',()=>document.getElementById('recMsensV').textContent=recMsens.value+'%');"
         "recMsens.addEventListener('change',()=>fetch('/rec?msens='+recMsens.value,{method:'POST'}));"
         "var mg=document.getElementById('maskgrid'),mb=document.getElementById('maskBtn');"
@@ -2190,6 +2239,7 @@ static httpd_uri_t uri_ntp        = { .uri = "/ntp",       .method = HTTP_POST, 
 static httpd_uri_t uri_rename     = { .uri = "/rename",    .method = HTTP_POST, .handler = rename_handler,   .user_ctx = NULL };
 static httpd_uri_t uri_copy       = { .uri = "/copy",      .method = HTTP_POST, .handler = copy_handler,     .user_ctx = NULL };
 static httpd_uri_t uri_sysinfo    = { .uri = "/sysinfo",   .method = HTTP_GET,  .handler = sysinfo_handler,  .user_ctx = NULL };
+static httpd_uri_t uri_detect     = { .uri = "/detect",    .method = HTTP_GET,  .handler = detect_handler,   .user_ctx = NULL };
 static httpd_uri_t uri_mask_get   = { .uri = "/mask",      .method = HTTP_GET,  .handler = mask_handler,     .user_ctx = NULL };
 static httpd_uri_t uri_mask_post  = { .uri = "/mask",      .method = HTTP_POST, .handler = mask_handler,     .user_ctx = NULL };
 
@@ -2235,6 +2285,7 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_rename);
         httpd_register_uri_handler(server, &uri_copy);
         httpd_register_uri_handler(server, &uri_sysinfo);
+        httpd_register_uri_handler(server, &uri_detect);
         httpd_register_uri_handler(server, &uri_mask_get);
         httpd_register_uri_handler(server, &uri_mask_post);
         ESP_LOGI(TAG, "HTTP server started");
@@ -2671,10 +2722,12 @@ static void url_decode(char *dst, const char *src, size_t dst_size) {
     dst[j] = '\0';
 }
 
+#if CONFIG_BT_NIMBLE_ENABLED
 /* ============================ BLE remote / info (NimBLE) ============================
  * Advertises as "XIAO-CAM" with a Nordic-UART-style GATT service so a phone
  * (e.g. nRF Connect) can read status (IP / version / recording) and send
- * commands ("rec on" / "rec off") — works even without knowing the IP. */
+ * commands ("rec on" / "rec off") — works even without knowing the IP.
+ * Compiled only when Bluetooth is enabled in sdkconfig (freed for ML otherwise). */
 static uint8_t ble_addr_type;
 static void ble_advertise(void);
 
@@ -2767,6 +2820,7 @@ static void ble_init(void) {
     ble_hs_cfg.sync_cb = ble_on_sync;
     nimble_port_freertos_init(ble_host_task);
 }
+#endif /* CONFIG_BT_NIMBLE_ENABLED */
 
 void app_main(void) {
     ESP_LOGI(TAG, "Starting XIAO ESP32S3 Sense Webcam");
@@ -2796,9 +2850,14 @@ void app_main(void) {
     if (init_mic() != ESP_OK) {
         ESP_LOGW(TAG, "Continuing without microphone");
     }
+    if (camera_ready) {
+        ml_ready = (person_detect_init() == 0);
+        ESP_LOGI(TAG, "Person detector: %s", ml_ready ? "ready" : "unavailable");
+    }
     init_sd_card();
     rec_cfg_load();
     sys_cfg_load();
+    if (ml_ready) person_set_thr_pct(motion_pconf);
     wifi_init_sta();
     ntp_apply();   /* start SNTP if enabled (network is up now) */
     init_mdns();
@@ -2806,5 +2865,7 @@ void app_main(void) {
     start_stream_webserver();
     /* Loop recorder runs continuously; it idles until enabled via the web UI. */
     xTaskCreate(rec_task, "rec_task", 6144, NULL, 4, NULL);
+#if CONFIG_BT_NIMBLE_ENABLED
     ble_init();
+#endif
 }
