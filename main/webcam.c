@@ -766,6 +766,21 @@ static void avi_chunk(avi_t *w, const char *fourcc, const uint8_t *data, uint32_
 static void avi_add_video(avi_t *w, const uint8_t *j, uint32_t n) { avi_chunk(w, "00dc", j, n, 0); }
 static void avi_add_audio(avi_t *w, const uint8_t *p, uint32_t n) { avi_chunk(w, "01wb", p, n, 1); }
 
+/* Make the still-open clip valid on disk right now: patch the header sizes to
+   the current length and flush to the card. If power is lost after this, the
+   file is playable up to here (no idx1, but players scan the movi list). */
+static void avi_checkpoint(avi_t *w) {
+    if (!w->f) return;
+    long end = ftell(w->f);
+    patch_u32(w->f, w->p_riff, (uint32_t)(end - 8));
+    patch_u32(w->f, w->p_totframes, w->vframes);
+    patch_u32(w->f, w->p_vidlen, w->vframes);
+    if (w->audio) patch_u32(w->f, w->p_audlen, w->abytes / 2);
+    patch_u32(w->f, w->p_movisz, 4 + w->movi_bytes);
+    fflush(w->f);
+    fsync(fileno(w->f));
+}
+
 static void avi_end(avi_t *w) {
     if (!w->f) return;
     FILE *f = w->f;
@@ -895,6 +910,9 @@ static void rec_task(void *arg) {
 
         snprintf(rec_status, sizeof(rec_status), "REC %s (%u frames%s)", cur,
                  (unsigned)w.vframes, have_mic ? "+audio" : "");
+        /* Crash-safety: every ~5 s make the on-disk clip valid + flush to card,
+           so a power cut / card pull loses at most a few seconds, not the clip. */
+        if (w.vframes % (REC_TARGET_FPS * 5) == 0) avi_checkpoint(&w);
         uint32_t seg_frames = (uint32_t)rec_seg_min * 60 * REC_TARGET_FPS;
         if (w.vframes >= seg_frames || w.movi_bytes >= REC_SEG_HARD_BYTES) {
             avi_end(&w); open = false; rec_enforce_budget();
