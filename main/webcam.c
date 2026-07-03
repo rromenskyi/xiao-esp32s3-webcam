@@ -17,6 +17,7 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "person_detect.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
@@ -194,6 +195,8 @@ static bool srt_enabled = true;            /* write a .srt sidecar with wall-clo
 static time_t rec_clip_start = 0;          /* wall-clock time the current clip started */
 static char webhook_url[160] = "";         /* POST here on a motion/person event (alarm) */
 static char cam_name[32] = "xiao-cam";     /* identifies this camera in alerts */
+static char tg_token[64] = "";             /* Telegram bot token (from @BotFather) */
+static char tg_chat[24]  = "";             /* Telegram chat id (from @userinfobot) */
 static int64_t webhook_last = 0;           /* rate-limit: last fire time (us) */
 static uint8_t *event_jpg = NULL;          /* snapshot of the moment a detection fired */
 static size_t event_jpg_len = 0, event_jpg_cap = 0;
@@ -340,6 +343,8 @@ static void sd_config_save_all(void) {
     fprintf(f, "srt=%d\n", srt_enabled ? 1 : 0);
     fprintf(f, "hook=%s\n", webhook_url);
     fprintf(f, "cname=%s\n", cam_name);
+    fprintf(f, "tgtok=%s\n", tg_token);
+    fprintf(f, "tgchat=%s\n", tg_chat);
     fclose(f);
     ESP_LOGI(TAG, "Config written to %s (%d networks)", SD_CONFIG_PATH, wifi_cred_count);
 }
@@ -376,6 +381,8 @@ static bool sd_config_load(void) {
         else if (strcmp(k, "srt") == 0)         srt_enabled = atoi(v) ? true : false;
         else if (strcmp(k, "hook") == 0)        strlcpy(webhook_url, v, sizeof(webhook_url));
         else if (strcmp(k, "cname") == 0)       { if (v[0]) strlcpy(cam_name, v, sizeof(cam_name)); }
+        else if (strcmp(k, "tgtok") == 0)       strlcpy(tg_token, v, sizeof(tg_token));
+        else if (strcmp(k, "tgchat") == 0)      strlcpy(tg_chat, v, sizeof(tg_chat));
     }
     if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }
     fclose(f);
@@ -702,6 +709,8 @@ static void sys_cfg_load(void) {
     nvs_get_str(h, "hook", webhook_url, &hl);
     size_t nl = sizeof(cam_name);
     nvs_get_str(h, "cname", cam_name, &nl);
+    size_t ttl = sizeof(tg_token); nvs_get_str(h, "tgtok", tg_token, &ttl);
+    size_t tcl = sizeof(tg_chat);  nvs_get_str(h, "tgchat", tg_chat, &tcl);
     size_t ml = sizeof(motion_mask);
     nvs_get_str(h, "mask", motion_mask, &ml);
     nvs_close(h);
@@ -718,6 +727,8 @@ static void sys_cfg_save(void) {
     nvs_set_i32(h, "srt", srt_enabled ? 1 : 0);
     nvs_set_str(h, "hook", webhook_url);
     nvs_set_str(h, "cname", cam_name);
+    nvs_set_str(h, "tgtok", tg_token);
+    nvs_set_str(h, "tgchat", tg_chat);
     nvs_set_str(h, "mask", motion_mask);
     nvs_commit(h);
     nvs_close(h);
@@ -970,6 +981,40 @@ static void save_event_snapshot(camera_fb_t *fb) {
     xSemaphoreGive(event_lock);
 }
 
+/* Send a photo with caption to Telegram directly (multipart, HTTPS). */
+static void telegram_send_photo(const char *caption, const uint8_t *jpg, size_t jlen) {
+    if (!tg_token[0] || !tg_chat[0] || !jpg || !jlen) return;
+    const char *bnd = "----xiaocamBOUNDARY7f3";
+    char head[512], tail[64];
+    int hn = snprintf(head, sizeof(head),
+        "--%s\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n%s\r\n"
+        "--%s\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n%s\r\n"
+        "--%s\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"event.jpg\"\r\n"
+        "Content-Type: image/jpeg\r\n\r\n", bnd, tg_chat, bnd, caption, bnd);
+    int tn = snprintf(tail, sizeof(tail), "\r\n--%s--\r\n", bnd);
+    size_t total = (size_t)hn + jlen + tn;
+    uint8_t *body = heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
+    if (!body) return;
+    memcpy(body, head, hn);
+    memcpy(body + hn, jpg, jlen);
+    memcpy(body + hn + jlen, tail, tn);
+    char url[128], ctype[80];
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendPhoto", tg_token);
+    snprintf(ctype, sizeof(ctype), "multipart/form-data; boundary=%s", bnd);
+    esp_http_client_config_t cfg = { .url = url, .method = HTTP_METHOD_POST,
+                                     .timeout_ms = 12000, .crt_bundle_attach = esp_crt_bundle_attach };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c) {
+        esp_http_client_set_header(c, "Content-Type", ctype);
+        esp_http_client_set_post_field(c, (const char *)body, total);
+        esp_err_t r = esp_http_client_perform(c);
+        ESP_LOGI(TAG, "telegram sendPhoto -> %s (HTTP %d)", esp_err_to_name(r),
+                 r == ESP_OK ? esp_http_client_get_status_code(c) : -1);
+        esp_http_client_cleanup(c);
+    }
+    free(body);
+}
+
 /* Fire the alarm webhook (runs in its own task so it never blocks recording). */
 static void webhook_task(void *arg) {
     char *event = (char *)arg;
@@ -977,17 +1022,37 @@ static void webhook_task(void *arg) {
     if (time_synced) { time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm); }
     char photo[80] = "";
     if (device_ip[0] && event_jpg_len) snprintf(photo, sizeof(photo), "http://%s/event.jpg", device_ip);
-    char body[320];
-    snprintf(body, sizeof(body), "{\"event\":\"%s\",\"camera\":\"%s\",\"time\":\"%s\",\"score\":%d,\"photo\":\"%s\"}",
-             event, cam_name, ts, ml_ready ? person_last_score_pct() : -1, photo);
-    esp_http_client_config_t cfg = { .url = webhook_url, .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
-    esp_http_client_handle_t c = esp_http_client_init(&cfg);
-    if (c) {
-        esp_http_client_set_header(c, "Content-Type", "application/json");
-        esp_http_client_set_post_field(c, body, strlen(body));
-        esp_err_t r = esp_http_client_perform(c);
-        ESP_LOGI(TAG, "webhook %s -> %s", event, r == ESP_OK ? "ok" : esp_err_to_name(r));
-        esp_http_client_cleanup(c);
+    int score = ml_ready ? person_last_score_pct() : -1;
+    if (webhook_url[0]) {                       /* generic JSON webhook */
+        char body[320];
+        snprintf(body, sizeof(body), "{\"event\":\"%s\",\"camera\":\"%s\",\"time\":\"%s\",\"score\":%d,\"photo\":\"%s\"}",
+                 event, cam_name, ts, score, photo);
+        esp_http_client_config_t cfg = { .url = webhook_url, .method = HTTP_METHOD_POST, .timeout_ms = 5000,
+                                         .crt_bundle_attach = esp_crt_bundle_attach };
+        esp_http_client_handle_t c = esp_http_client_init(&cfg);
+        if (c) {
+            esp_http_client_set_header(c, "Content-Type", "application/json");
+            esp_http_client_set_post_field(c, body, strlen(body));
+            esp_err_t r = esp_http_client_perform(c);
+            ESP_LOGI(TAG, "webhook %s -> %s", event, r == ESP_OK ? "ok" : esp_err_to_name(r));
+            esp_http_client_cleanup(c);
+        }
+    }
+    if (tg_token[0] && tg_chat[0]) {            /* direct Telegram photo */
+        char caption[128];
+        snprintf(caption, sizeof(caption), "%s: %s%s%s%s", cam_name, event,
+                 ts[0] ? " at " : "", ts, score >= 0 ? "" : "");
+        if (score >= 0) { char sc[16]; snprintf(sc, sizeof(sc), " (%d%%)", score); strlcat(caption, sc, sizeof(caption)); }
+        uint8_t *buf = NULL; size_t blen = 0;
+        if (event_lock && xSemaphoreTake(event_lock, pdMS_TO_TICKS(500)) == pdTRUE) {
+            if (event_jpg_len) { buf = heap_caps_malloc(event_jpg_len, MALLOC_CAP_SPIRAM); if (buf) { memcpy(buf, event_jpg, event_jpg_len); blen = event_jpg_len; } }
+            xSemaphoreGive(event_lock);
+        }
+        if (!buf && camera_ready) {             /* test / no snapshot yet: grab a fresh frame */
+            camera_fb_t *fb = esp_camera_fb_get();
+            if (fb) { if (fb->format == PIXFORMAT_JPEG) { buf = heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM); if (buf) { memcpy(buf, fb->buf, fb->len); blen = fb->len; } } esp_camera_fb_return(fb); }
+        }
+        if (buf) { telegram_send_photo(caption, buf, blen); free(buf); }
     }
     free(event);
     vTaskDelete(NULL);
@@ -995,12 +1060,12 @@ static void webhook_task(void *arg) {
 
 /* Trigger the alarm webhook on a new detection event (rate-limited to 1 / 10 s). */
 static void webhook_notify(const char *event) {
-    if (!webhook_url[0]) return;
+    if (!webhook_url[0] && !(tg_token[0] && tg_chat[0])) return;
     int64_t now = esp_timer_get_time();
     if (webhook_last && now - webhook_last < 10LL * 1000 * 1000) return;
     webhook_last = now;
     char *ev = strdup(event);
-    if (ev && xTaskCreate(webhook_task, "webhook", 4096, ev, 5, NULL) != pdPASS) free(ev);
+    if (ev && xTaskCreate(webhook_task, "webhook", 8192, ev, 5, NULL) != pdPASS) free(ev);
 }
 
 /* Write a subtitle sidecar (clip.srt) with one wall-clock caption per second, so
@@ -1511,7 +1576,19 @@ static esp_err_t event_jpg_handler(httpd_req_t *req) {
     return r;
 }
 
-/* Alarm webhook config: GET returns the URL; POST body sets it; ?test=1 fires a test. */
+static int hexv(char c) { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; }
+static void urldecode(char *s) {
+    char *d = s; int a, b;
+    while (*s) {
+        if (*s == '%' && (a = hexv(s[1])) >= 0 && (b = hexv(s[2])) >= 0) { *d++ = (char)(a * 16 + b); s += 3; }
+        else if (*s == '+') { *d++ = ' '; s++; }
+        else *d++ = *s++;
+    }
+    *d = 0;
+}
+
+/* Alarm config: GET returns url/name/chat/tg; POST body sets webhook url; query
+   params name/tgtok/tgchat set those; ?test=1 fires a test alert. */
 static esp_err_t webhook_handler(httpd_req_t *req) {
     if (req->method == HTTP_POST) {
         char buf[200];
@@ -1519,13 +1596,18 @@ static esp_err_t webhook_handler(httpd_req_t *req) {
         int r = len > 0 ? httpd_req_recv(req, buf, len) : 0;
         if (r >= 0) { buf[r] = 0; strlcpy(webhook_url, buf, sizeof(webhook_url)); sys_cfg_save(); }
     }
-    char q[80], v[40];
+    char q[256], v[96];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
-        if (httpd_query_key_value(q, "name", v, sizeof(v)) == ESP_OK && v[0]) { strlcpy(cam_name, v, sizeof(cam_name)); sys_cfg_save(); }
+        bool ch = false;
+        if (httpd_query_key_value(q, "name", v, sizeof(v)) == ESP_OK && v[0]) { urldecode(v); strlcpy(cam_name, v, sizeof(cam_name)); ch = true; }
+        if (httpd_query_key_value(q, "tgtok", v, sizeof(v)) == ESP_OK) { urldecode(v); if (v[0]) { strlcpy(tg_token, v, sizeof(tg_token)); ch = true; } }
+        if (httpd_query_key_value(q, "tgchat", v, sizeof(v)) == ESP_OK) { urldecode(v); strlcpy(tg_chat, v, sizeof(tg_chat)); ch = true; }
+        if (ch) sys_cfg_save();
         if (httpd_query_key_value(q, "test", v, sizeof(v)) == ESP_OK) { webhook_last = 0; webhook_notify("test"); }
     }
     char body[256];
-    snprintf(body, sizeof(body), "{\"url\":\"%s\",\"name\":\"%s\"}", webhook_url, cam_name);
+    snprintf(body, sizeof(body), "{\"url\":\"%s\",\"name\":\"%s\",\"chat\":\"%s\",\"tg\":%s}",
+             webhook_url, cam_name, tg_chat, tg_token[0] ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
 }
@@ -2181,8 +2263,11 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<input id='camName' type='text' placeholder='front-door' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)'></div>"
         "<div class='ctl' style='margin-top:10px'><div class='row'><label for='hookUrl'>Alarm webhook</label><span class='val' id='hookState'></span></div>"
         "<input id='hookUrl' type='text' placeholder='https://your-server/alert' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)'>"
-        "<div class='toolbar' style='margin-top:6px'><button class='btn' id='hookSave' type='button'>Save</button><button class='btn' id='hookTest' type='button'>Test</button></div>"
-        "<div style='color:var(--muted);font-size:12px;margin-top:4px'>POSTs {event,camera,time,score,photo} on detection. photo = a snapshot of the moment (also at /event.jpg).</div></div>"
+        "<div style='color:var(--muted);font-size:12px;margin-top:4px'>Generic: POSTs {event,camera,time,score,photo} on detection.</div></div>"
+        "<div class='ctl' style='margin-top:10px'><div class='row'><label>Telegram (sends the photo directly)</label><span class='val' id='tgState'></span></div>"
+        "<input id='tgTok' type='password' placeholder='bot token from @BotFather' autocomplete='off' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);margin-bottom:6px'>"
+        "<input id='tgChat' type='text' placeholder='chat id from @userinfobot' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)'></div>"
+        "<div class='toolbar' style='margin-top:8px'><button class='btn primary' id='hookSave' type='button'>Save all</button><button class='btn' id='hookTest' type='button'>Send test</button></div>"
         "</section>");
 
     /* ---- SD Files (recordings browser) ---- */
@@ -2322,10 +2407,10 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "document.getElementById('recMl').onchange=e=>{fetch('/rec?ml='+(e.target.checked?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "var recPconf=document.getElementById('recPconf');recPconf.addEventListener('input',()=>document.getElementById('recPconfV').textContent=recPconf.value+'%');recPconf.addEventListener('change',()=>fetch('/rec?pconf='+recPconf.value,{method:'POST'}));"
         "document.getElementById('recSrt').onchange=e=>fetch('/rec?srt='+(e.target.checked?1:0),{method:'POST'});"
-        "fetch('/webhook').then(r=>r.json()).then(d=>{document.getElementById('hookUrl').value=d.url||'';document.getElementById('camName').value=d.name||'';}).catch(()=>{});"
-        "function hookSaveAll(){return fetch('/webhook?name='+encodeURIComponent(document.getElementById('camName').value),{method:'POST',body:document.getElementById('hookUrl').value});}"
-        "document.getElementById('hookSave').onclick=async()=>{await hookSaveAll();recRefresh();};"
-        "document.getElementById('hookTest').onclick=async()=>{await hookSaveAll();const r=await(await fetch('/webhook?test=1')).json();alert('Test sent to: '+(r.url||'(none)'));};"
+        "fetch('/webhook').then(r=>r.json()).then(d=>{document.getElementById('hookUrl').value=d.url||'';document.getElementById('camName').value=d.name||'';document.getElementById('tgChat').value=d.chat||'';document.getElementById('tgState').textContent=d.tg?'saved':'off';if(d.tg)document.getElementById('tgTok').placeholder='saved — leave blank to keep';}).catch(()=>{});"
+        "function hookSaveAll(){return fetch('/webhook?name='+encodeURIComponent(document.getElementById('camName').value)+'&tgtok='+encodeURIComponent(document.getElementById('tgTok').value)+'&tgchat='+encodeURIComponent(document.getElementById('tgChat').value),{method:'POST',body:document.getElementById('hookUrl').value});}"
+        "document.getElementById('hookSave').onclick=async()=>{await hookSaveAll();document.getElementById('tgTok').value='';recRefresh();};"
+        "document.getElementById('hookTest').onclick=async()=>{await hookSaveAll();document.getElementById('tgTok').value='';await fetch('/webhook?test=1');alert('Test alert sent (check your chat / webhook).');};"
         "var recMsens=document.getElementById('recMsens');recMsens.addEventListener('input',()=>document.getElementById('recMsensV').textContent=recMsens.value+'%');"
         "recMsens.addEventListener('change',()=>fetch('/rec?msens='+recMsens.value,{method:'POST'}));"
         "var mg=document.getElementById('maskgrid'),mb=document.getElementById('maskBtn');"
@@ -3056,10 +3141,10 @@ void app_main(void) {
         ESP_LOGI(TAG, "Person detector: %s", ml_ready ? "ready" : "unavailable");
     }
     init_sd_card();
-    rec_cfg_load();
+    wifi_init_sta();          /* may seed settings + networks from an SD config (fresh board) */
+    rec_cfg_load();           /* NVS is authoritative — load it AFTER the SD seed so it wins */
     sys_cfg_load();
     if (ml_ready) person_set_thr_pct(motion_pconf);
-    wifi_init_sta();
     ntp_apply();   /* start SNTP if enabled (network is up now) */
     init_mdns();
     start_webserver();

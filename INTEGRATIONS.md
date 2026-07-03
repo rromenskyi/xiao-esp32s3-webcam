@@ -60,10 +60,26 @@ many cameras and show the snapshot inline.
 
 ---
 
-## 3. Telegram (needs a tiny relay)
+## 3. Telegram — built in (no relay!)
 
-Telegram's API wants `chat_id` + `text`, so point the camera at a small relay that
-reformats our JSON. Pick one:
+The camera sends the **snapshot with a caption straight to your chat** over HTTPS.
+
+1. Message **@BotFather** → `/newbot` → copy the **bot token**.
+2. Message your new bot once (say "hi"), then message **@userinfobot** → copy your **chat id**.
+3. Web UI → **Recording** card → **Telegram**: paste the token + chat id → **Save all** → **Send test**.
+
+That's it — on each detection you get a photo captioned
+`front-door: person at 2026-07-04 01:00:31 (33%)`. No server, no relay.
+
+> The token is stored on the device (NVS + SD backup) and never shown back in the UI.
+> Works alongside the generic webhook — set either, both, or neither.
+
+---
+
+### Prefer a relay instead? (advanced)
+
+Telegram's API wants `chat_id` + `text`, so point the camera's **generic webhook** at a
+small relay that reformats the JSON. Pick one:
 
 ### Option A — Home Assistant as the relay
 If you already have HA + the Telegram integration, use the automation in §2 but call
