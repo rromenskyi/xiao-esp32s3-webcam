@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "esp_camera.h"
 #include "img_converters.h"
+#include "esp_http_client.h"
 #include "person_detect.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
@@ -75,6 +76,8 @@ static esp_err_t ntp_handler(httpd_req_t *req);
 static esp_err_t sysinfo_handler(httpd_req_t *req);
 static esp_err_t mask_handler(httpd_req_t *req);
 static esp_err_t detect_handler(httpd_req_t *req);
+static esp_err_t rec_clear_handler(httpd_req_t *req);
+static esp_err_t webhook_handler(httpd_req_t *req);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
@@ -186,6 +189,10 @@ static bool rec_audio = true;              /* mux audio into clips when mic is p
 static int  rec_budget_pct = 80;           /* keep total clips under this % of the card */
 static int  rec_seg_min = 15;              /* rotate to a new clip every N minutes (configurable) */
 static char rec_cur_file[48] = "";         /* name of the clip currently being written */
+static bool srt_enabled = true;            /* write a .srt sidecar with wall-clock time */
+static time_t rec_clip_start = 0;          /* wall-clock time the current clip started */
+static char webhook_url[160] = "";         /* POST here on a motion/person event (alarm) */
+static int64_t webhook_last = 0;           /* rate-limit: last fire time (us) */
 
 /* Motion-gated recording (heuristic: background subtraction on a 1/8 frame). */
 static bool motion_enabled = false;        /* record only while there is motion */
@@ -325,6 +332,8 @@ static void sd_config_save_all(void) {
     fprintf(f, "motion=%d\n", motion_enabled ? 1 : 0);
     fprintf(f, "msens=%d\n", motion_sens);
     fprintf(f, "mask=%s\n", motion_mask);
+    fprintf(f, "srt=%d\n", srt_enabled ? 1 : 0);
+    fprintf(f, "hook=%s\n", webhook_url);
     fclose(f);
     ESP_LOGI(TAG, "Config written to %s (%d networks)", SD_CONFIG_PATH, wifi_cred_count);
 }
@@ -358,6 +367,8 @@ static bool sd_config_load(void) {
         else if (strcmp(k, "motion") == 0)      motion_enabled = atoi(v) ? true : false;
         else if (strcmp(k, "msens") == 0)       { int s = atoi(v); if (s >= 1 && s <= 30) motion_sens = s; }
         else if (strcmp(k, "mask") == 0)        { if (strlen(v) == MASK_COLS * MASK_ROWS) strlcpy(motion_mask, v, sizeof(motion_mask)); }
+        else if (strcmp(k, "srt") == 0)         srt_enabled = atoi(v) ? true : false;
+        else if (strcmp(k, "hook") == 0)        strlcpy(webhook_url, v, sizeof(webhook_url));
     }
     if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }
     fclose(f);
@@ -679,6 +690,9 @@ static void sys_cfg_load(void) {
     if (nvs_get_i32(h, "msens", &v) == ESP_OK && v >= 1 && v <= 30) motion_sens = v;
     if (nvs_get_i32(h, "mlc", &v) == ESP_OK) motion_ml = v ? true : false;
     if (nvs_get_i32(h, "pconf", &v) == ESP_OK && v >= 10 && v <= 90) motion_pconf = v;
+    if (nvs_get_i32(h, "srt", &v) == ESP_OK) srt_enabled = v ? true : false;
+    size_t hl = sizeof(webhook_url);
+    nvs_get_str(h, "hook", webhook_url, &hl);
     size_t ml = sizeof(motion_mask);
     nvs_get_str(h, "mask", motion_mask, &ml);
     nvs_close(h);
@@ -692,6 +706,8 @@ static void sys_cfg_save(void) {
     nvs_set_i32(h, "msens", motion_sens);
     nvs_set_i32(h, "mlc", motion_ml ? 1 : 0);
     nvs_set_i32(h, "pconf", motion_pconf);
+    nvs_set_i32(h, "srt", srt_enabled ? 1 : 0);
+    nvs_set_str(h, "hook", webhook_url);
     nvs_set_str(h, "mask", motion_mask);
     nvs_commit(h);
     nvs_close(h);
@@ -873,7 +889,7 @@ static void rec_enforce_budget(void) {
     if (!d) return;
     struct dirent *e;
     while ((e = readdir(d)) && n < 256) {
-        if (strncmp(e->d_name, "clip", 4) != 0) continue;
+        if (strncmp(e->d_name, "clip", 4) != 0 || !strstr(e->d_name, ".avi")) continue;
         char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", e->d_name);
         struct stat st; if (stat(full, &st) != 0) continue;
         strlcpy(names[n], e->d_name, sizeof(names[n])); sizes[n] = st.st_size; mtimes[n] = st.st_mtime;
@@ -932,6 +948,69 @@ static int motion_score(camera_fb_t *fb) {
     return counted > 0 ? (int)(changed * 100 / counted) : 0;
 }
 
+/* Fire the alarm webhook (runs in its own task so it never blocks recording). */
+static void webhook_task(void *arg) {
+    char *event = (char *)arg;
+    char ts[24] = "";
+    if (time_synced) { time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm); }
+    char body[224];
+    snprintf(body, sizeof(body), "{\"event\":\"%s\",\"device\":\"xiao-cam\",\"time\":\"%s\",\"score\":%d}",
+             event, ts, ml_ready ? person_last_score_pct() : -1);
+    esp_http_client_config_t cfg = { .url = webhook_url, .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c) {
+        esp_http_client_set_header(c, "Content-Type", "application/json");
+        esp_http_client_set_post_field(c, body, strlen(body));
+        esp_err_t r = esp_http_client_perform(c);
+        ESP_LOGI(TAG, "webhook %s -> %s", event, r == ESP_OK ? "ok" : esp_err_to_name(r));
+        esp_http_client_cleanup(c);
+    }
+    free(event);
+    vTaskDelete(NULL);
+}
+
+/* Trigger the alarm webhook on a new detection event (rate-limited to 1 / 10 s). */
+static void webhook_notify(const char *event) {
+    if (!webhook_url[0]) return;
+    int64_t now = esp_timer_get_time();
+    if (webhook_last && now - webhook_last < 10LL * 1000 * 1000) return;
+    webhook_last = now;
+    char *ev = strdup(event);
+    if (ev && xTaskCreate(webhook_task, "webhook", 4096, ev, 5, NULL) != pdPASS) free(ev);
+}
+
+/* Write a subtitle sidecar (clip.srt) with one wall-clock caption per second, so
+   a player (VLC) shows the real time while playing. Zero cost to the video. */
+static void write_clip_srt(const char *avi_name, time_t start, int frames, int fps) {
+    if (!srt_enabled || start == 0 || frames <= 0 || fps <= 0 || !avi_name[0]) return;
+    char p[300];
+    snprintf(p, sizeof(p), REC_DIR "/%s", avi_name);
+    char *dot = strrchr(p, '.');
+    if (dot && (size_t)(dot - p) < sizeof(p) - 5) strcpy(dot, ".srt");
+    else return;
+    FILE *f = fopen(p, "w");
+    if (!f) return;
+    int secs = (frames + fps - 1) / fps;
+    for (int s = 0; s < secs; s++) {
+        time_t t = start + s; struct tm tm; localtime_r(&t, &tm);
+        char ts[24]; strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
+        fprintf(f, "%d\n%02d:%02d:%02d,000 --> %02d:%02d:%02d,000\n%s\n\n",
+                s + 1, s / 3600, (s % 3600) / 60, s % 60,
+                (s + 1) / 3600, ((s + 1) % 3600) / 60, (s + 1) % 60, ts);
+    }
+    fclose(f);
+}
+
+/* Finalize the current clip: close the AVI, drop its .srt sidecar, enforce budget. */
+static void close_clip(avi_t *w) {
+    int frames = w->vframes;
+    avi_end(w);
+    write_clip_srt(rec_cur_file, rec_clip_start, frames, REC_TARGET_FPS);
+    rec_cur_file[0] = '\0';
+    rec_clip_start = 0;
+    rec_enforce_budget();
+}
+
 static void rec_task(void *arg) {
     avi_t w; bool open = false, have_mic = false; char cur[32] = "";
     int16_t *apcm = NULL;
@@ -940,7 +1019,7 @@ static void rec_task(void *arg) {
     int mcheck = 0, mcool = 0;   /* motion sub-sample counter, cooldown frames */
     while (1) {
         if (!rec_enabled || !sd_ready || !camera_ready) {
-            if (open) { avi_end(&w); open = false; rec_cur_file[0] = '\0'; rec_enforce_budget(); }
+            if (open) { close_clip(&w); open = false; }
             if (have_mic) { xSemaphoreGive(mic_lock); have_mic = false; }
             snprintf(rec_status, sizeof(rec_status), "%s", !sd_ready ? "idle (no SD)" : "idle");
             vTaskDelay(pdMS_TO_TICKS(400));
@@ -950,6 +1029,7 @@ static void rec_task(void *arg) {
         if (want_audio && !have_mic) { if (xSemaphoreTake(mic_lock, 0) == pdTRUE) have_mic = true; }
         if (!want_audio && have_mic) { xSemaphoreGive(mic_lock); have_mic = false; }
 
+        int64_t fstart = esp_timer_get_time();
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
 
@@ -961,12 +1041,15 @@ static void rec_task(void *arg) {
                 if (motion_last_score >= motion_sens) {
                     /* Heuristic fired. If ML is on, only record when it's a person. */
                     bool trigger = (motion_ml && ml_ready) ? (person_in_frame(fb) != 0) : true;
-                    if (trigger) mcool = REC_TARGET_FPS * 5;
+                    if (trigger) {
+                        if (mcool == 0) webhook_notify(motion_ml && ml_ready ? "person" : "motion");  /* new event */
+                        mcool = REC_TARGET_FPS * 5;
+                    }
                 }
             }
             if (mcool > 0) { mcool--; motion_active = true; } else motion_active = false;
             if (!motion_active) {
-                if (open) { avi_end(&w); open = false; rec_cur_file[0] = '\0'; rec_enforce_budget(); }
+                if (open) { close_clip(&w); open = false; }
                 esp_camera_fb_return(fb);
                 snprintf(rec_status, sizeof(rec_status), "armed - waiting for motion");
                 vTaskDelay(pdMS_TO_TICKS(1000 / REC_TARGET_FPS));
@@ -981,6 +1064,7 @@ static void rec_task(void *arg) {
             if (avi_begin(&w, path, fb->width, fb->height, REC_TARGET_FPS, have_mic, MIC_SAMPLE_RATE)) {
                 open = true;
                 strlcpy(rec_cur_file, cur, sizeof(rec_cur_file));
+                rec_clip_start = time_synced ? time(NULL) : 0;
             } else {
                 esp_camera_fb_return(fb);
                 snprintf(rec_status, sizeof(rec_status), "error: cannot create clip");
@@ -1006,7 +1090,9 @@ static void rec_task(void *arg) {
                 avi_add_audio(&w, (uint8_t *)apcm, cnt * 2);
             }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(1000 / REC_TARGET_FPS));
+            int budget = 1000 / REC_TARGET_FPS;
+            int spent = (int)((esp_timer_get_time() - fstart) / 1000);
+            if (spent < budget) vTaskDelay(pdMS_TO_TICKS(budget - spent));  /* only wait the remainder */
         }
 
         snprintf(rec_status, sizeof(rec_status), "REC %s (%u frames%s)", cur,
@@ -1016,7 +1102,7 @@ static void rec_task(void *arg) {
         if (w.vframes % (REC_TARGET_FPS * 2) == 0) avi_checkpoint(&w);
         uint32_t seg_frames = (uint32_t)rec_seg_min * 60 * REC_TARGET_FPS;
         if (w.vframes >= seg_frames || w.movi_bytes >= REC_SEG_HARD_BYTES) {
-            avi_end(&w); open = false; rec_cur_file[0] = '\0'; rec_enforce_budget();
+            close_clip(&w); open = false;
         }
     }
 }
@@ -1032,6 +1118,7 @@ static esp_err_t rec_toggle_handler(httpd_req_t *req) {
         if (httpd_query_key_value(q, "msens", v, sizeof(v)) == ESP_OK) { int s = atoi(v); if (s >= 1 && s <= 30) { motion_sens = s; sys_cfg_save(); } }
         if (httpd_query_key_value(q, "ml", v, sizeof(v)) == ESP_OK) { motion_ml = atoi(v) ? true : false; sys_cfg_save(); }
         if (httpd_query_key_value(q, "pconf", v, sizeof(v)) == ESP_OK) { int p = atoi(v); if (p >= 10 && p <= 90) { motion_pconf = p; person_set_thr_pct(p); sys_cfg_save(); } }
+        if (httpd_query_key_value(q, "srt", v, sizeof(v)) == ESP_OK) { srt_enabled = atoi(v) ? true : false; sys_cfg_save(); }
     }
     char body[200];
     snprintf(body, sizeof(body), "{\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d}",
@@ -1051,7 +1138,7 @@ static esp_err_t rec_list_handler(httpd_req_t *req) {
     if (d) {
         struct dirent *e;
         while ((e = readdir(d))) {
-            if (strncmp(e->d_name, "clip", 4) != 0) continue;
+            if (strncmp(e->d_name, "clip", 4) != 0 || !strstr(e->d_name, ".avi")) continue;
             char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", e->d_name);
             struct stat st; if (stat(full, &st) != 0) continue;
             used += st.st_size;
@@ -1066,10 +1153,11 @@ static esp_err_t rec_list_handler(httpd_req_t *req) {
         closedir(d);
     }
     char tail[500];
-    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d,\"mactive\":%s,\"mscore\":%d,\"ml\":%s,\"mlready\":%s,\"pconf\":%d,\"mlscore\":%d,\"used\":%llu,\"total\":%llu,\"active\":\"%s\",\"status\":\"%s\"}",
+    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d,\"mactive\":%s,\"mscore\":%d,\"ml\":%s,\"mlready\":%s,\"pconf\":%d,\"mlscore\":%d,\"srt\":%s,\"webhook\":%s,\"used\":%llu,\"total\":%llu,\"active\":\"%s\",\"status\":\"%s\"}",
              rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct, rec_seg_min,
              motion_enabled ? "true" : "false", motion_sens, motion_active ? "true" : "false", motion_last_score,
              motion_ml ? "true" : "false", ml_ready ? "true" : "false", motion_pconf, ml_ready ? person_last_score_pct() : -1,
+             srt_enabled ? "true" : "false", webhook_url[0] ? "true" : "false",
              (unsigned long long)used, (unsigned long long)total, rec_cur_file, rec_status);
     httpd_resp_sendstr_chunk(req, tail);
     return httpd_resp_sendstr_chunk(req, NULL);
@@ -1382,6 +1470,44 @@ static esp_err_t detect_handler(httpd_req_t *req) {
     char body[160];
     snprintf(body, sizeof(body), "{\"ready\":true,\"person\":%s,\"score\":%d,\"ms\":%d,\"w\":%d,\"h\":%d}",
              person ? "true" : "false", person_last_score_pct(), ms, fb->width, fb->height);
+    return httpd_resp_sendstr(req, body);
+}
+
+/* Alarm webhook config: GET returns the URL; POST body sets it; ?test=1 fires a test. */
+static esp_err_t webhook_handler(httpd_req_t *req) {
+    if (req->method == HTTP_POST) {
+        char buf[200];
+        int len = req->content_len < (int)sizeof(buf) - 1 ? req->content_len : (int)sizeof(buf) - 1;
+        int r = len > 0 ? httpd_req_recv(req, buf, len) : 0;
+        if (r >= 0) { buf[r] = 0; strlcpy(webhook_url, buf, sizeof(webhook_url)); sys_cfg_save(); }
+    }
+    char q[16], v[4];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "test", v, sizeof(v)) == ESP_OK) { webhook_last = 0; webhook_notify("test"); }
+    char body[224];
+    snprintf(body, sizeof(body), "{\"url\":\"%s\"}", webhook_url);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
+/* Delete all recorded clips (except the one being written right now). */
+static esp_err_t rec_clear_handler(httpd_req_t *req) {
+    int deleted = 0;
+    DIR *d = opendir(REC_DIR);
+    if (d) {
+        struct dirent *e;
+        char path[300];
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            if (rec_cur_file[0] && strcmp(e->d_name, rec_cur_file) == 0) continue;
+            snprintf(path, sizeof(path), REC_DIR "/%s", e->d_name);
+            if (unlink(path) == 0) deleted++;
+        }
+        closedir(d);
+    }
+    char body[48];
+    snprintf(body, sizeof(body), "{\"deleted\":%d}", deleted);
+    httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
 }
 
@@ -1934,6 +2060,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         ".badge{background:rgba(0,0,0,.55);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.14);color:#fff;font-size:12px;font-weight:600;padding:5px 11px;border-radius:999px}"
         ".badge.live{color:var(--accent)}.badge.live::before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:6px;vertical-align:middle;animation:pulse 2s infinite}"
         ".maskgrid{position:absolute;inset:0;display:grid;grid-template-columns:repeat(8,1fr);grid-template-rows:repeat(6,1fr);z-index:3}.mcell{border:1px solid rgba(255,255,255,.14);cursor:pointer}.mcell.on{background:rgba(229,72,77,.5)}.mcell:hover{background:rgba(255,255,255,.12)}"
+        ".clockov{position:absolute;left:10px;bottom:10px;padding:3px 9px;background:rgba(0,0,0,.55);color:#fff;font:600 13px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;border-radius:6px;z-index:4;pointer-events:none;letter-spacing:.5px}"
         ".offline{aspect-ratio:4/3;display:grid;place-content:center;text-align:center;color:var(--muted);padding:24px;gap:6px}.offline h2{margin:0;color:var(--text);font-size:20px}.offline p{margin:0}"
         ".toolbar{display:flex;gap:10px;margin:14px 0;flex-wrap:wrap}"
         ".btn{flex:1;min-width:120px;height:44px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text);font-weight:600;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;text-decoration:none;transition:.15s}"
@@ -1963,6 +2090,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
             "<div class='frame'><div class='badges'><span class='badge live'>LIVE</span>"
             "<span class='badge' id='res'>VGA 640×480</span></div>"
             "<img id='cam' crossorigin='anonymous' alt='Camera stream'>"
+            "<div class='clockov' id='clockov'></div>"
             "<div class='maskgrid' id='maskgrid' style='display:none'></div></div>"
             "<div class='toolbar'>"
             "<button class='btn primary' id='snap' type='button'>Snapshot</button>"
@@ -2046,10 +2174,16 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<div class='ctl'><div class='row'><label for='recMsens'>Motion threshold</label><span class='val' id='recMsensV'>5%</span></div><input id='recMsens' type='range' min='1' max='30' value='5'></div>"
         "<div class='ctl switch'><label for='recMl'>Confirm with AI (person only)</label><label class='tgl'><input id='recMl' type='checkbox'><span class='sl'></span></label></div>"
         "<div class='ctl'><div class='row'><label for='recPconf'>AI person confidence</label><span class='val' id='recPconfV'>25%</span></div><input id='recPconf' type='range' min='10' max='90' value='25'></div>"
+        "<div class='ctl switch'><label for='recSrt'>Timestamp subtitles (.srt)</label><label class='tgl'><input id='recSrt' type='checkbox'><span class='sl'></span></label></div>"
         "<div class='toolbar' style='margin:0'><button class='btn' id='maskBtn' type='button'>Edit ignore zones</button></div>"
         "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden;margin:10px 0'><div id='recBar' style='height:100%;width:0;background:var(--accent);transition:width .3s'></div></div>"
         "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
         "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
+        "<div class='toolbar' style='margin-top:8px'><button class='btn danger' id='recClear' type='button'>Clear all recordings</button></div>"
+        "<div class='ctl' style='margin-top:12px'><div class='row'><label for='hookUrl'>Alarm webhook</label><span class='val' id='hookState'></span></div>"
+        "<input id='hookUrl' type='text' placeholder='https://your-server/alert' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)'>"
+        "<div class='toolbar' style='margin-top:6px'><button class='btn' id='hookSave' type='button'>Save</button><button class='btn' id='hookTest' type='button'>Test</button></div>"
+        "<div style='color:var(--muted);font-size:12px;margin-top:4px'>POSTs JSON {event,time,score} when motion/person is detected</div></div>"
         "</section>"
         "<section class='card'><h3>System</h3><div class='kv' id='sysinfo'></div></section>"
         "<section class='card'><h3>Time</h3>"
@@ -2125,6 +2259,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "document.getElementById('recMotion').checked=d.motion;var _ms=document.getElementById('recMsens');if(document.activeElement!==_ms){_ms.value=d.msens;document.getElementById('recMsensV').textContent=d.msens+'%';}"
         "var _ml=document.getElementById('recMl');_ml.checked=d.ml;_ml.disabled=!d.mlready;_ml.parentElement.style.opacity=d.mlready?'1':'.5';"
         "var _pc=document.getElementById('recPconf');if(document.activeElement!==_pc){_pc.value=d.pconf;document.getElementById('recPconfV').textContent=d.pconf+'% (now '+(d.mlscore>=0?d.mlscore+'%':'-')+')';}"
+        "document.getElementById('recSrt').checked=d.srt;"
+        "document.getElementById('hookState').textContent=d.webhook?'active':'off';"
         "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const live=cl.name===d.active;const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML='<span>'+(live?'● ':'')+cl.name+' ('+((cl.size/1048576)|0)+' MB)'+(cl.mtime?'  ·  '+cl.mtime:'')+(live?'  · recording':'')+'</span>';if(!live){const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);}c.appendChild(r);});}catch(e){}}"
         "recBtn.onclick=async()=>{await fetch('/rec?on='+(recBtn.textContent.startsWith('Start')?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "document.getElementById('recAudio').onchange=async e=>{await fetch('/rec?audio='+(e.target.checked?1:0),{method:'POST'});};"
@@ -2135,6 +2271,10 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "document.getElementById('recMotion').onchange=e=>{fetch('/rec?motion='+(e.target.checked?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "document.getElementById('recMl').onchange=e=>{fetch('/rec?ml='+(e.target.checked?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "var recPconf=document.getElementById('recPconf');recPconf.addEventListener('input',()=>document.getElementById('recPconfV').textContent=recPconf.value+'%');recPconf.addEventListener('change',()=>fetch('/rec?pconf='+recPconf.value,{method:'POST'}));"
+        "document.getElementById('recSrt').onchange=e=>fetch('/rec?srt='+(e.target.checked?1:0),{method:'POST'});"
+        "fetch('/webhook').then(r=>r.json()).then(d=>document.getElementById('hookUrl').value=d.url||'').catch(()=>{});"
+        "document.getElementById('hookSave').onclick=async()=>{await fetch('/webhook',{method:'POST',body:document.getElementById('hookUrl').value});recRefresh();};"
+        "document.getElementById('hookTest').onclick=async()=>{await fetch('/webhook',{method:'POST',body:document.getElementById('hookUrl').value});const r=await(await fetch('/webhook?test=1')).json();alert('Test sent to: '+(r.url||'(none)'));};"
         "var recMsens=document.getElementById('recMsens');recMsens.addEventListener('input',()=>document.getElementById('recMsensV').textContent=recMsens.value+'%');"
         "recMsens.addEventListener('change',()=>fetch('/rec?msens='+recMsens.value,{method:'POST'}));"
         "var mg=document.getElementById('maskgrid'),mb=document.getElementById('maskBtn');"
@@ -2142,6 +2282,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "function mrender(){mg.innerHTML='';for(let i=0;i<mgrid.length;i++){const c=document.createElement('div');c.className='mcell'+(mgrid[i]==='1'?' on':'');c.onclick=async()=>{mgrid=mgrid.substring(0,i)+(mgrid[i]==='1'?'0':'1')+mgrid.substring(i+1);c.classList.toggle('on');await fetch('/mask?grid='+mgrid,{method:'POST'});};mg.appendChild(c);}}"
         "fetch('/mask').then(r=>r.json()).then(d=>{mgrid=d.grid;mg.style.gridTemplateColumns='repeat('+d.cols+',1fr)';mg.style.gridTemplateRows='repeat('+d.rows+',1fr)';mrender();}).catch(()=>{});"
         "mb.onclick=()=>{const show=mg.style.display==='none';mg.style.display=show?'grid':'none';mb.textContent=show?'Done editing zones':'Edit ignore zones';if(show)window.scrollTo({top:0,behavior:'smooth'});};}"
+        "setInterval(()=>{var c=document.getElementById('clockov');if(!c)return;var z=n=>String(n).padStart(2,'0'),d=new Date();c.textContent=d.getFullYear()+'-'+z(d.getMonth()+1)+'-'+z(d.getDate())+' '+z(d.getHours())+':'+z(d.getMinutes())+':'+z(d.getSeconds());},1000);"
+        "document.getElementById('recClear').onclick=async()=>{if(!confirm('Delete all recorded clips?'))return;const r=await(await fetch('/rec/clear',{method:'POST'})).json();alert('Deleted '+r.deleted+' clips');recRefresh();};"
         "setInterval(recRefresh,3000);recRefresh();"
         /* SD file browser */
         "let fbCur='/sdcard';"
@@ -2240,6 +2382,9 @@ static httpd_uri_t uri_rename     = { .uri = "/rename",    .method = HTTP_POST, 
 static httpd_uri_t uri_copy       = { .uri = "/copy",      .method = HTTP_POST, .handler = copy_handler,     .user_ctx = NULL };
 static httpd_uri_t uri_sysinfo    = { .uri = "/sysinfo",   .method = HTTP_GET,  .handler = sysinfo_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_detect     = { .uri = "/detect",    .method = HTTP_GET,  .handler = detect_handler,   .user_ctx = NULL };
+static httpd_uri_t uri_rec_clear  = { .uri = "/rec/clear", .method = HTTP_POST, .handler = rec_clear_handler, .user_ctx = NULL };
+static httpd_uri_t uri_hook_get   = { .uri = "/webhook",   .method = HTTP_GET,  .handler = webhook_handler,  .user_ctx = NULL };
+static httpd_uri_t uri_hook_post  = { .uri = "/webhook",   .method = HTTP_POST, .handler = webhook_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_mask_get   = { .uri = "/mask",      .method = HTTP_GET,  .handler = mask_handler,     .user_ctx = NULL };
 static httpd_uri_t uri_mask_post  = { .uri = "/mask",      .method = HTTP_POST, .handler = mask_handler,     .user_ctx = NULL };
 
@@ -2253,7 +2398,7 @@ static httpd_handle_t start_webserver(void) {
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 28;
+    config.max_uri_handlers = 34;
     config.max_resp_headers = 8;
     /* index_handler builds sizable HTML on-stack; 4 KB default is too tight. */
     config.stack_size = 8192;
@@ -2286,6 +2431,9 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_copy);
         httpd_register_uri_handler(server, &uri_sysinfo);
         httpd_register_uri_handler(server, &uri_detect);
+        httpd_register_uri_handler(server, &uri_rec_clear);
+        httpd_register_uri_handler(server, &uri_hook_get);
+        httpd_register_uri_handler(server, &uri_hook_post);
         httpd_register_uri_handler(server, &uri_mask_get);
         httpd_register_uri_handler(server, &uri_mask_post);
         ESP_LOGI(TAG, "HTTP server started");
