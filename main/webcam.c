@@ -15,6 +15,7 @@
 #include "esp_mac.h"
 #include "nvs_flash.h"
 #include "esp_camera.h"
+#include "img_converters.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
@@ -180,6 +181,13 @@ static bool rec_audio = true;              /* mux audio into clips when mic is p
 static int  rec_budget_pct = 80;           /* keep total clips under this % of the card */
 static int  rec_seg_min = 15;              /* rotate to a new clip every N minutes (configurable) */
 static char rec_cur_file[48] = "";         /* name of the clip currently being written */
+
+/* Motion-gated recording (heuristic: background subtraction on a 1/8 frame). */
+static bool motion_enabled = false;        /* record only while there is motion */
+static int  motion_sens = 5;               /* % of pixels changed to count as motion (1..30) */
+static volatile bool motion_active = false;
+static volatile int  motion_last_score = -1;   /* last measured motion %, -1 = not measured yet */
+#define MOTION_PIX_THRESH 18               /* per-pixel luma delta that counts as changed */
 
 /* NTP time sync (opt-in; off by default). When synced, clips are named by time. */
 #define SYS_NVS_NS "sys_cfg"
@@ -649,6 +657,8 @@ static void sys_cfg_load(void) {
     if (nvs_get_i32(h, "ntp", &v) == ESP_OK) ntp_enabled = v ? true : false;
     size_t tl = sizeof(ntp_tz);
     nvs_get_str(h, "tz", ntp_tz, &tl);
+    if (nvs_get_i32(h, "motion", &v) == ESP_OK) motion_enabled = v ? true : false;
+    if (nvs_get_i32(h, "msens", &v) == ESP_OK && v >= 1 && v <= 30) motion_sens = v;
     nvs_close(h);
 }
 static void sys_cfg_save(void) {
@@ -656,6 +666,8 @@ static void sys_cfg_save(void) {
     if (nvs_open(SYS_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_i32(h, "ntp", ntp_enabled ? 1 : 0);
     nvs_set_str(h, "tz", ntp_tz);
+    nvs_set_i32(h, "motion", motion_enabled ? 1 : 0);
+    nvs_set_i32(h, "msens", motion_sens);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -856,11 +868,47 @@ static void rec_enforce_budget(void) {
     }
 }
 
+/* Approx luma of an rgb565 pixel (0..255). */
+static inline uint8_t rgb565_luma(uint16_t p) {
+    int r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+    return (uint8_t)((((r << 3) * 77) + ((g << 2) * 150) + ((b << 3) * 29)) >> 8);
+}
+
+/* Decode the frame at 1/8 scale and return % of pixels that changed vs a slowly
+   adapting background. Buffers live in PSRAM. Returns 0 on the first frame. */
+static uint8_t *motion_bg = NULL, *motion_rgb = NULL;
+static int motion_bg_w = 0, motion_bg_h = 0;
+static int motion_score(camera_fb_t *fb) {
+    int w = fb->width / 8, h = fb->height / 8;
+    size_t npix = (size_t)w * h;
+    if (w <= 0 || h <= 0 || npix > 200 * 150) return -2;
+    if (!motion_rgb) { motion_rgb = heap_caps_malloc(200 * 150 * 2, MALLOC_CAP_SPIRAM); if (!motion_rgb) return -2; }
+    if (!jpg2rgb565(fb->buf, fb->len, motion_rgb, JPG_SCALE_8X)) return -2;
+    uint16_t *px = (uint16_t *)motion_rgb;
+    if (!motion_bg || motion_bg_w != w || motion_bg_h != h) {
+        if (motion_bg) free(motion_bg);
+        motion_bg = heap_caps_malloc(npix, MALLOC_CAP_SPIRAM);
+        motion_bg_w = w; motion_bg_h = h;
+        if (!motion_bg) return -2;
+        for (size_t i = 0; i < npix; i++) motion_bg[i] = rgb565_luma(px[i]);
+        return -1;
+    }
+    int changed = 0;
+    for (size_t i = 0; i < npix; i++) {
+        uint8_t lum = rgb565_luma(px[i]);
+        int d = (int)lum - (int)motion_bg[i]; if (d < 0) d = -d;
+        if (d > MOTION_PIX_THRESH) changed++;
+        motion_bg[i] = (uint8_t)((motion_bg[i] * 7 + lum) / 8);   /* slow adapt */
+    }
+    return (int)(changed * 100 / npix);
+}
+
 static void rec_task(void *arg) {
     avi_t w; bool open = false, have_mic = false; char cur[32] = "";
     int16_t *apcm = NULL;
     const int aframe = MIC_SAMPLE_RATE / REC_TARGET_FPS;
     float dcx = 0, dcy = 0;
+    int mcheck = 0, mcool = 0;   /* motion sub-sample counter, cooldown frames */
     while (1) {
         if (!rec_enabled || !sd_ready || !camera_ready) {
             if (open) { avi_end(&w); open = false; rec_cur_file[0] = '\0'; rec_enforce_budget(); }
@@ -875,6 +923,20 @@ static void rec_task(void *arg) {
 
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+
+        /* Motion gate: when enabled, only record while there is motion (+ tail). */
+        if (motion_enabled) {
+            if (++mcheck >= 3) { mcheck = 0; motion_last_score = motion_score(fb); if (motion_last_score >= motion_sens) mcool = REC_TARGET_FPS * 5; }
+            if (mcool > 0) { mcool--; motion_active = true; } else motion_active = false;
+            if (!motion_active) {
+                if (open) { avi_end(&w); open = false; rec_cur_file[0] = '\0'; rec_enforce_budget(); }
+                esp_camera_fb_return(fb);
+                snprintf(rec_status, sizeof(rec_status), "armed - waiting for motion");
+                vTaskDelay(pdMS_TO_TICKS(1000 / REC_TARGET_FPS));
+                continue;
+            }
+        }
+
         if (!open) {
             mkdir(REC_DIR, 0777);
             char path[80]; rec_next_path(path, sizeof(path));
@@ -929,10 +991,13 @@ static esp_err_t rec_toggle_handler(httpd_req_t *req) {
         if (httpd_query_key_value(q, "pct", v, sizeof(v)) == ESP_OK) { int p = atoi(v); if (p >= 10 && p <= 95) { rec_budget_pct = p; rec_cfg_save(); } }
         if (httpd_query_key_value(q, "audio", v, sizeof(v)) == ESP_OK) { rec_audio = atoi(v) ? true : false; rec_cfg_save(); }
         if (httpd_query_key_value(q, "seg", v, sizeof(v)) == ESP_OK) { int m = atoi(v); if (m >= 1 && m <= 60) { rec_seg_min = m; rec_cfg_save(); } }
+        if (httpd_query_key_value(q, "motion", v, sizeof(v)) == ESP_OK) { motion_enabled = atoi(v) ? true : false; sys_cfg_save(); }
+        if (httpd_query_key_value(q, "msens", v, sizeof(v)) == ESP_OK) { int s = atoi(v); if (s >= 1 && s <= 30) { motion_sens = s; sys_cfg_save(); } }
     }
-    char body[160];
-    snprintf(body, sizeof(body), "{\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d}",
-             rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct, rec_seg_min);
+    char body[200];
+    snprintf(body, sizeof(body), "{\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d}",
+             rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct, rec_seg_min,
+             motion_enabled ? "true" : "false", motion_sens);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
 }
@@ -961,9 +1026,10 @@ static esp_err_t rec_list_handler(httpd_req_t *req) {
         }
         closedir(d);
     }
-    char tail[320];
-    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"used\":%llu,\"total\":%llu,\"active\":\"%s\",\"status\":\"%s\"}",
+    char tail[380];
+    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d,\"mactive\":%s,\"mscore\":%d,\"used\":%llu,\"total\":%llu,\"active\":\"%s\",\"status\":\"%s\"}",
              rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct, rec_seg_min,
+             motion_enabled ? "true" : "false", motion_sens, motion_active ? "true" : "false", motion_last_score,
              (unsigned long long)used, (unsigned long long)total, rec_cur_file, rec_status);
     httpd_resp_sendstr_chunk(req, tail);
     return httpd_resp_sendstr_chunk(req, NULL);
@@ -1897,6 +1963,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "</div>"
         "<div class='ctl'><div class='row'><label for='recPct'>Disk budget</label><span class='val' id='recPctV'>80%</span></div><input id='recPct' type='range' min='10' max='95' value='80'></div>"
         "<div class='ctl'><div class='row'><label for='recSeg'>Clip length</label><span class='val' id='recSegV'>15 min</span></div><input id='recSeg' type='range' min='1' max='60' value='15'></div>"
+        "<div class='ctl switch'><label for='recMotion'>Record on motion only</label><label class='tgl'><input id='recMotion' type='checkbox'><span class='sl'></span></label></div>"
+        "<div class='ctl'><div class='row'><label for='recMsens'>Motion threshold</label><span class='val' id='recMsensV'>5%</span></div><input id='recMsens' type='range' min='1' max='30' value='5'></div>"
         "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden;margin:10px 0'><div id='recBar' style='height:100%;width:0;background:var(--accent);transition:width .3s'></div></div>"
         "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
         "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
@@ -1967,11 +2035,12 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "const recBtn=document.getElementById('recBtn'),recPct=document.getElementById('recPct');"
         "async function recRefresh(){try{const d=await (await fetch('/rec/list')).json();"
         "recBtn.textContent=d.enabled?'Stop recording':'Start recording';recBtn.classList.toggle('danger',d.enabled);"
-        "document.getElementById('recState').textContent=d.status;document.getElementById('recAudio').checked=d.audio;"
+        "document.getElementById('recState').textContent=d.status+(d.motion?'  ·  motion '+(d.mscore>=0?d.mscore+'%':'...'):'');document.getElementById('recAudio').checked=d.audio;"
         "const budget=d.total*d.pct/100;document.getElementById('recBar').style.width=Math.min(100,budget?d.used/budget*100:0)+'%';"
         "document.getElementById('recUse').textContent=((d.used/1048576)|0)+' MB / '+((budget/1048576)|0)+' MB';"
         "if(document.activeElement!==recPct){recPct.value=d.pct;document.getElementById('recPctV').textContent=d.pct+'%';}"
         "var _rs=document.getElementById('recSeg');if(document.activeElement!==_rs){_rs.value=d.seg;document.getElementById('recSegV').textContent=d.seg+' min';}"
+        "document.getElementById('recMotion').checked=d.motion;var _ms=document.getElementById('recMsens');if(document.activeElement!==_ms){_ms.value=d.msens;document.getElementById('recMsensV').textContent=d.msens+'%';}"
         "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const live=cl.name===d.active;const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML='<span>'+(live?'● ':'')+cl.name+' ('+((cl.size/1048576)|0)+' MB)'+(cl.mtime?'  ·  '+cl.mtime:'')+(live?'  · recording':'')+'</span>';if(!live){const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);}c.appendChild(r);});}catch(e){}}"
         "recBtn.onclick=async()=>{await fetch('/rec?on='+(recBtn.textContent.startsWith('Start')?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "document.getElementById('recAudio').onchange=async e=>{await fetch('/rec?audio='+(e.target.checked?1:0),{method:'POST'});};"
@@ -1979,6 +2048,9 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "recPct.addEventListener('change',()=>fetch('/rec?pct='+recPct.value,{method:'POST'}));"
         "var recSeg=document.getElementById('recSeg');recSeg.addEventListener('input',()=>document.getElementById('recSegV').textContent=recSeg.value+' min');"
         "recSeg.addEventListener('change',()=>fetch('/rec?seg='+recSeg.value,{method:'POST'}));"
+        "document.getElementById('recMotion').onchange=e=>{fetch('/rec?motion='+(e.target.checked?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
+        "var recMsens=document.getElementById('recMsens');recMsens.addEventListener('input',()=>document.getElementById('recMsensV').textContent=recMsens.value+'%');"
+        "recMsens.addEventListener('change',()=>fetch('/rec?msens='+recMsens.value,{method:'POST'}));"
         "setInterval(recRefresh,3000);recRefresh();"
         /* SD file browser */
         "let fbCur='/sdcard';"
