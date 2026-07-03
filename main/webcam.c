@@ -78,6 +78,7 @@ static esp_err_t mask_handler(httpd_req_t *req);
 static esp_err_t detect_handler(httpd_req_t *req);
 static esp_err_t rec_clear_handler(httpd_req_t *req);
 static esp_err_t webhook_handler(httpd_req_t *req);
+static esp_err_t event_jpg_handler(httpd_req_t *req);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
@@ -192,7 +193,11 @@ static char rec_cur_file[48] = "";         /* name of the clip currently being w
 static bool srt_enabled = true;            /* write a .srt sidecar with wall-clock time */
 static time_t rec_clip_start = 0;          /* wall-clock time the current clip started */
 static char webhook_url[160] = "";         /* POST here on a motion/person event (alarm) */
+static char cam_name[32] = "xiao-cam";     /* identifies this camera in alerts */
 static int64_t webhook_last = 0;           /* rate-limit: last fire time (us) */
+static uint8_t *event_jpg = NULL;          /* snapshot of the moment a detection fired */
+static size_t event_jpg_len = 0, event_jpg_cap = 0;
+static SemaphoreHandle_t event_lock = NULL;
 
 /* Motion-gated recording (heuristic: background subtraction on a 1/8 frame). */
 static bool motion_enabled = false;        /* record only while there is motion */
@@ -334,6 +339,7 @@ static void sd_config_save_all(void) {
     fprintf(f, "mask=%s\n", motion_mask);
     fprintf(f, "srt=%d\n", srt_enabled ? 1 : 0);
     fprintf(f, "hook=%s\n", webhook_url);
+    fprintf(f, "cname=%s\n", cam_name);
     fclose(f);
     ESP_LOGI(TAG, "Config written to %s (%d networks)", SD_CONFIG_PATH, wifi_cred_count);
 }
@@ -369,6 +375,7 @@ static bool sd_config_load(void) {
         else if (strcmp(k, "mask") == 0)        { if (strlen(v) == MASK_COLS * MASK_ROWS) strlcpy(motion_mask, v, sizeof(motion_mask)); }
         else if (strcmp(k, "srt") == 0)         srt_enabled = atoi(v) ? true : false;
         else if (strcmp(k, "hook") == 0)        strlcpy(webhook_url, v, sizeof(webhook_url));
+        else if (strcmp(k, "cname") == 0)       { if (v[0]) strlcpy(cam_name, v, sizeof(cam_name)); }
     }
     if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }
     fclose(f);
@@ -693,6 +700,8 @@ static void sys_cfg_load(void) {
     if (nvs_get_i32(h, "srt", &v) == ESP_OK) srt_enabled = v ? true : false;
     size_t hl = sizeof(webhook_url);
     nvs_get_str(h, "hook", webhook_url, &hl);
+    size_t nl = sizeof(cam_name);
+    nvs_get_str(h, "cname", cam_name, &nl);
     size_t ml = sizeof(motion_mask);
     nvs_get_str(h, "mask", motion_mask, &ml);
     nvs_close(h);
@@ -708,6 +717,7 @@ static void sys_cfg_save(void) {
     nvs_set_i32(h, "pconf", motion_pconf);
     nvs_set_i32(h, "srt", srt_enabled ? 1 : 0);
     nvs_set_str(h, "hook", webhook_url);
+    nvs_set_str(h, "cname", cam_name);
     nvs_set_str(h, "mask", motion_mask);
     nvs_commit(h);
     nvs_close(h);
@@ -948,14 +958,28 @@ static int motion_score(camera_fb_t *fb) {
     return counted > 0 ? (int)(changed * 100 / counted) : 0;
 }
 
+/* Stash a copy of the frame that triggered a detection, served at /event.jpg. */
+static void save_event_snapshot(camera_fb_t *fb) {
+    if (!event_lock || !fb || fb->format != PIXFORMAT_JPEG) return;
+    if (xSemaphoreTake(event_lock, 0) != pdTRUE) return;
+    if (event_jpg_cap < fb->len) {
+        uint8_t *p = heap_caps_realloc(event_jpg, fb->len, MALLOC_CAP_SPIRAM);
+        if (p) { event_jpg = p; event_jpg_cap = fb->len; }
+    }
+    if (event_jpg_cap >= fb->len) { memcpy(event_jpg, fb->buf, fb->len); event_jpg_len = fb->len; }
+    xSemaphoreGive(event_lock);
+}
+
 /* Fire the alarm webhook (runs in its own task so it never blocks recording). */
 static void webhook_task(void *arg) {
     char *event = (char *)arg;
     char ts[24] = "";
     if (time_synced) { time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm); }
-    char body[224];
-    snprintf(body, sizeof(body), "{\"event\":\"%s\",\"device\":\"xiao-cam\",\"time\":\"%s\",\"score\":%d}",
-             event, ts, ml_ready ? person_last_score_pct() : -1);
+    char photo[80] = "";
+    if (device_ip[0] && event_jpg_len) snprintf(photo, sizeof(photo), "http://%s/event.jpg", device_ip);
+    char body[320];
+    snprintf(body, sizeof(body), "{\"event\":\"%s\",\"camera\":\"%s\",\"time\":\"%s\",\"score\":%d,\"photo\":\"%s\"}",
+             event, cam_name, ts, ml_ready ? person_last_score_pct() : -1, photo);
     esp_http_client_config_t cfg = { .url = webhook_url, .method = HTTP_METHOD_POST, .timeout_ms = 5000 };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (c) {
@@ -1042,7 +1066,7 @@ static void rec_task(void *arg) {
                     /* Heuristic fired. If ML is on, only record when it's a person. */
                     bool trigger = (motion_ml && ml_ready) ? (person_in_frame(fb) != 0) : true;
                     if (trigger) {
-                        if (mcool == 0) webhook_notify(motion_ml && ml_ready ? "person" : "motion");  /* new event */
+                        if (mcool == 0) { save_event_snapshot(fb); webhook_notify(motion_ml && ml_ready ? "person" : "motion"); }  /* new event */
                         mcool = REC_TARGET_FPS * 5;
                     }
                 }
@@ -1473,6 +1497,20 @@ static esp_err_t detect_handler(httpd_req_t *req) {
     return httpd_resp_sendstr(req, body);
 }
 
+/* Serve the snapshot of the last detection event (for the alarm photo). */
+static esp_err_t event_jpg_handler(httpd_req_t *req) {
+    if (!event_lock || xSemaphoreTake(event_lock, pdMS_TO_TICKS(500)) != pdTRUE || event_jpg_len == 0) {
+        if (event_lock) xSemaphoreGive(event_lock);
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no event snapshot yet");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t r = httpd_resp_send(req, (const char *)event_jpg, event_jpg_len);
+    xSemaphoreGive(event_lock);
+    return r;
+}
+
 /* Alarm webhook config: GET returns the URL; POST body sets it; ?test=1 fires a test. */
 static esp_err_t webhook_handler(httpd_req_t *req) {
     if (req->method == HTTP_POST) {
@@ -1481,11 +1519,13 @@ static esp_err_t webhook_handler(httpd_req_t *req) {
         int r = len > 0 ? httpd_req_recv(req, buf, len) : 0;
         if (r >= 0) { buf[r] = 0; strlcpy(webhook_url, buf, sizeof(webhook_url)); sys_cfg_save(); }
     }
-    char q[16], v[4];
-    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
-        httpd_query_key_value(q, "test", v, sizeof(v)) == ESP_OK) { webhook_last = 0; webhook_notify("test"); }
-    char body[224];
-    snprintf(body, sizeof(body), "{\"url\":\"%s\"}", webhook_url);
+    char q[80], v[40];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "name", v, sizeof(v)) == ESP_OK && v[0]) { strlcpy(cam_name, v, sizeof(cam_name)); sys_cfg_save(); }
+        if (httpd_query_key_value(q, "test", v, sizeof(v)) == ESP_OK) { webhook_last = 0; webhook_notify("test"); }
+    }
+    char body[256];
+    snprintf(body, sizeof(body), "{\"url\":\"%s\",\"name\":\"%s\"}", webhook_url, cam_name);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
 }
@@ -2118,51 +2158,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
             "<p>Check the camera module and reboot the board.</p></div></div>");
     }
 
-    if (mic_ready) {
-        httpd_resp_sendstr_chunk(req,
-            "<section class='card'><h3>Microphone</h3>"
-            "<div class='toolbar' style='margin:0 0 12px'>"
-            "<button class='btn primary' id='rec' type='button'>Record 5s</button>"
-            "<a class='btn' id='dl' href='/audio.wav?secs=5' download='xiao-audio.wav'>Download WAV</a>"
-            "</div>"
-            "<audio id='player' controls style='width:100%'></audio>"
-            "<div class='meta'><span id='micState'>PDM mono · 16 kHz</span><span>Wake word: coming soon</span></div>"
-            "</section>");
-    }
-
-    httpd_resp_sendstr_chunk(req, "<section class='card'><h3>Storage &amp; Power</h3><div class='toolbar' style='margin:0'>");
-    if (sd_ready) {
-        httpd_resp_sendstr_chunk(req, "<button class='btn danger' id='formatSd' type='button'>Format SD</button>");
-    }
-    httpd_resp_sendstr_chunk(req, "<button class='btn danger' id='reboot' type='button'>Reboot</button></div><div class='meta'><span>");
-    httpd_resp_sendstr_chunk(req, sd_status_html);
-    httpd_resp_sendstr_chunk(req, "</span><span>");
-    httpd_resp_sendstr_chunk(req, sd_ready ? "Storage ready" : "Storage offline");
-    httpd_resp_sendstr_chunk(req, "</span></div></section>");
-
-    /* Firmware / OTA card */
-    /* Build metadata is compiler/CMake/git controlled ASCII — no HTML escaping
-       needed, and large escape buffers here overflow the httpd task stack. */
-    const esp_app_desc_t *app = esp_app_get_description();
-    char fw_line[128], tools_line[160];
-    snprintf(fw_line, sizeof(fw_line), "%s %s (built %s %s)",
-             app->project_name, app->version, app->date, app->time);
-    snprintf(tools_line, sizeof(tools_line), "ESP-IDF %s / GCC %s", app->idf_ver, __VERSION__);
+    /* ---- Recording (core feature) ---- */
     httpd_resp_sendstr_chunk(req,
-        "<section class='card'><h3>Firmware</h3>"
-        "<div class='meta' style='margin:0 0 4px'><span>Running: ");
-    httpd_resp_sendstr_chunk(req, fw_line);
-    httpd_resp_sendstr_chunk(req, "</span></div><div class='meta' style='margin:0 0 12px'><span>Built with: ");
-    httpd_resp_sendstr_chunk(req, tools_line);
-    httpd_resp_sendstr_chunk(req,
-        "</span></div>"
-        "<div class='toolbar' style='margin:0 0 10px'>"
-        "<input id='fw' type='file' accept='.bin' style='flex:2;min-width:180px;height:44px;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text)'>"
-        "<button class='btn primary' id='flash' type='button'>Flash over WiFi</button>"
-        "</div>"
-        "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden'><div id='otabar' style='height:100%;width:0;background:var(--accent);transition:width .2s'></div></div>"
-        "<div class='meta'><span id='otaState'>Select a .bin and flash. The board reboots into it automatically.</span></div>"
-        "</section>"
         "<section class='card'><h3>Recording (loop to SD)</h3>"
         "<div class='toolbar' style='margin:0 0 10px'>"
         "<button class='btn primary' id='recBtn' type='button'>Start recording</button>"
@@ -2180,12 +2177,47 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<div class='meta'><span id='recState'>idle</span><span id='recUse'></span></div>"
         "<div id='clips' style='display:flex;flex-direction:column;gap:6px;margin-top:8px'></div>"
         "<div class='toolbar' style='margin-top:8px'><button class='btn danger' id='recClear' type='button'>Clear all recordings</button></div>"
-        "<div class='ctl' style='margin-top:12px'><div class='row'><label for='hookUrl'>Alarm webhook</label><span class='val' id='hookState'></span></div>"
+        "<div class='ctl' style='margin-top:12px'><div class='row'><label for='camName'>Camera name</label></div>"
+        "<input id='camName' type='text' placeholder='front-door' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)'></div>"
+        "<div class='ctl' style='margin-top:10px'><div class='row'><label for='hookUrl'>Alarm webhook</label><span class='val' id='hookState'></span></div>"
         "<input id='hookUrl' type='text' placeholder='https://your-server/alert' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)'>"
         "<div class='toolbar' style='margin-top:6px'><button class='btn' id='hookSave' type='button'>Save</button><button class='btn' id='hookTest' type='button'>Test</button></div>"
-        "<div style='color:var(--muted);font-size:12px;margin-top:4px'>POSTs JSON {event,time,score} when motion/person is detected</div></div>"
+        "<div style='color:var(--muted);font-size:12px;margin-top:4px'>POSTs {event,camera,time,score,photo} on detection. photo = a snapshot of the moment (also at /event.jpg).</div></div>"
+        "</section>");
+
+    /* ---- SD Files (recordings browser) ---- */
+    httpd_resp_sendstr_chunk(req,
+        "<section class='card'><h3>SD Files</h3>"
+        "<div class='toolbar' style='margin:0 0 10px'><button class='btn' id='cfgBackup' type='button'>Backup config to SD</button></div>"
+        "<div class='meta' style='margin:0 0 10px'><span id='cfgState'>Config (incl. WiFi) can be saved to SD and auto-loaded on a fresh board.</span></div>"
+        "<div class='meta' style='margin:0 0 10px'><span id='fbPath'>/sdcard</span><button class='btn' id='fbUp' type='button' style='flex:0;min-width:70px;height:32px'>Up</button></div>"
+        "<div id='fbList' style='display:flex;flex-direction:column;gap:6px'></div>"
+        "</section>");
+
+    /* ---- Microphone ---- */
+    if (mic_ready) {
+        httpd_resp_sendstr_chunk(req,
+            "<section class='card'><h3>Microphone</h3>"
+            "<div class='toolbar' style='margin:0 0 12px'>"
+            "<button class='btn primary' id='rec' type='button'>Record 5s</button>"
+            "<a class='btn' id='dl' href='/audio.wav?secs=5' download='xiao-audio.wav'>Download WAV</a>"
+            "</div>"
+            "<audio id='player' controls style='width:100%'></audio>"
+            "<div class='meta'><span id='micState'>PDM mono · 16 kHz</span><span>Wake word: coming soon</span></div>"
+            "</section>");
+    }
+
+    /* ---- WiFi + Time ---- */
+    httpd_resp_sendstr_chunk(req,
+        "<section class='card'><h3>WiFi networks</h3>"
+        "<div id='wifiList' style='display:flex;flex-direction:column;gap:6px;margin-bottom:10px'></div>"
+        "<div class='toolbar' style='margin:0 0 8px'>"
+        "<input id='wSsid' placeholder='SSID' style='flex:1;min-width:110px;height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:0 10px'>"
+        "<input id='wPass' type='password' placeholder='Password' style='flex:1;min-width:110px;height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:0 10px'>"
+        "<button class='btn primary' id='wAdd' type='button'>Add</button>"
+        "</div>"
+        "<div class='meta'><span id='wifiState'>The board connects to the strongest known network on boot.</span></div>"
         "</section>"
-        "<section class='card'><h3>System</h3><div class='kv' id='sysinfo'></div></section>"
         "<section class='card'><h3>Time</h3>"
         "<div class='meta' style='margin:0 0 10px'><span id='clock' style='font-variant-numeric:tabular-nums;font-size:16px;color:var(--text)'>--:--:--</span><span id='ntpState'>NTP off</span></div>"
         "<div class='toolbar' style='margin:0'>"
@@ -2210,23 +2242,41 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<option value='NZST-12NZDT,M9.5.0,M4.1.0/3'>Pacific/Auckland</option>"
         "</select>"
         "</div>"
-        "</section>"
-        "<section class='card'><h3>WiFi networks</h3>"
-        "<div id='wifiList' style='display:flex;flex-direction:column;gap:6px;margin-bottom:10px'></div>"
-        "<div class='toolbar' style='margin:0 0 8px'>"
-        "<input id='wSsid' placeholder='SSID' style='flex:1;min-width:110px;height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:0 10px'>"
-        "<input id='wPass' type='password' placeholder='Password' style='flex:1;min-width:110px;height:40px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:0 10px'>"
-        "<button class='btn primary' id='wAdd' type='button'>Add</button>"
+        "</section>");
+
+    /* ---- Storage & Power (runtime status) ---- */
+    httpd_resp_sendstr_chunk(req, "<section class='card'><h3>Storage &amp; Power</h3><div class='toolbar' style='margin:0'>");
+    if (sd_ready) httpd_resp_sendstr_chunk(req, "<button class='btn danger' id='formatSd' type='button'>Format SD</button>");
+    httpd_resp_sendstr_chunk(req, "<button class='btn danger' id='reboot' type='button'>Reboot</button></div><div class='meta'><span>");
+    httpd_resp_sendstr_chunk(req, sd_status_html);
+    httpd_resp_sendstr_chunk(req, "</span><span>");
+    httpd_resp_sendstr_chunk(req, sd_ready ? "Storage ready" : "Storage offline");
+    httpd_resp_sendstr_chunk(req, "</span></div></section>");
+
+    /* ---- System ---- */
+    httpd_resp_sendstr_chunk(req, "<section class='card'><h3>System</h3><div class='kv' id='sysinfo'></div></section>");
+
+    /* ---- Firmware / OTA (advanced, last) ---- */
+    const esp_app_desc_t *app = esp_app_get_description();
+    char fw_line[128], tools_line[160];
+    snprintf(fw_line, sizeof(fw_line), "%s %s (built %s %s)",
+             app->project_name, app->version, app->date, app->time);
+    snprintf(tools_line, sizeof(tools_line), "ESP-IDF %s / GCC %s", app->idf_ver, __VERSION__);
+    httpd_resp_sendstr_chunk(req, "<section class='card'><h3>Firmware</h3><div class='meta' style='margin:0 0 4px'><span>Running: ");
+    httpd_resp_sendstr_chunk(req, fw_line);
+    httpd_resp_sendstr_chunk(req, "</span></div><div class='meta' style='margin:0 0 12px'><span>Built with: ");
+    httpd_resp_sendstr_chunk(req, tools_line);
+    httpd_resp_sendstr_chunk(req,
+        "</span></div>"
+        "<div class='toolbar' style='margin:0 0 10px'>"
+        "<input id='fw' type='file' accept='.bin' style='flex:2;min-width:180px;height:44px;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--text)'>"
+        "<button class='btn primary' id='flash' type='button'>Flash over WiFi</button>"
         "</div>"
-        "<div class='meta'><span id='wifiState'>The board connects to the strongest known network on boot.</span></div>"
-        "</section>"
-        "<section class='card'><h3>SD Files</h3>"
-        "<div class='toolbar' style='margin:0 0 10px'><button class='btn' id='cfgBackup' type='button'>Backup config to SD</button></div>"
-        "<div class='meta' style='margin:0 0 10px'><span id='cfgState'>Config (incl. WiFi) can be saved to SD and auto-loaded on a fresh board.</span></div>"
-        "<div class='meta' style='margin:0 0 10px'><span id='fbPath'>/sdcard</span><button class='btn' id='fbUp' type='button' style='flex:0;min-width:70px;height:32px'>Up</button></div>"
-        "<div id='fbList' style='display:flex;flex-direction:column;gap:6px'></div>"
-        "</section>"
-        "</main><script>");
+        "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden'><div id='otabar' style='height:100%;width:0;background:var(--accent);transition:width .2s'></div></div>"
+        "<div class='meta'><span id='otaState'>Select a .bin and flash. The board reboots into it automatically.</span></div>"
+        "</section>");
+
+    httpd_resp_sendstr_chunk(req, "</main><script>");
 
     if (camera_ready) {
         httpd_resp_sendstr_chunk(req,
@@ -2272,9 +2322,10 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "document.getElementById('recMl').onchange=e=>{fetch('/rec?ml='+(e.target.checked?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "var recPconf=document.getElementById('recPconf');recPconf.addEventListener('input',()=>document.getElementById('recPconfV').textContent=recPconf.value+'%');recPconf.addEventListener('change',()=>fetch('/rec?pconf='+recPconf.value,{method:'POST'}));"
         "document.getElementById('recSrt').onchange=e=>fetch('/rec?srt='+(e.target.checked?1:0),{method:'POST'});"
-        "fetch('/webhook').then(r=>r.json()).then(d=>document.getElementById('hookUrl').value=d.url||'').catch(()=>{});"
-        "document.getElementById('hookSave').onclick=async()=>{await fetch('/webhook',{method:'POST',body:document.getElementById('hookUrl').value});recRefresh();};"
-        "document.getElementById('hookTest').onclick=async()=>{await fetch('/webhook',{method:'POST',body:document.getElementById('hookUrl').value});const r=await(await fetch('/webhook?test=1')).json();alert('Test sent to: '+(r.url||'(none)'));};"
+        "fetch('/webhook').then(r=>r.json()).then(d=>{document.getElementById('hookUrl').value=d.url||'';document.getElementById('camName').value=d.name||'';}).catch(()=>{});"
+        "function hookSaveAll(){return fetch('/webhook?name='+encodeURIComponent(document.getElementById('camName').value),{method:'POST',body:document.getElementById('hookUrl').value});}"
+        "document.getElementById('hookSave').onclick=async()=>{await hookSaveAll();recRefresh();};"
+        "document.getElementById('hookTest').onclick=async()=>{await hookSaveAll();const r=await(await fetch('/webhook?test=1')).json();alert('Test sent to: '+(r.url||'(none)'));};"
         "var recMsens=document.getElementById('recMsens');recMsens.addEventListener('input',()=>document.getElementById('recMsensV').textContent=recMsens.value+'%');"
         "recMsens.addEventListener('change',()=>fetch('/rec?msens='+recMsens.value,{method:'POST'}));"
         "var mg=document.getElementById('maskgrid'),mb=document.getElementById('maskBtn');"
@@ -2383,6 +2434,7 @@ static httpd_uri_t uri_copy       = { .uri = "/copy",      .method = HTTP_POST, 
 static httpd_uri_t uri_sysinfo    = { .uri = "/sysinfo",   .method = HTTP_GET,  .handler = sysinfo_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_detect     = { .uri = "/detect",    .method = HTTP_GET,  .handler = detect_handler,   .user_ctx = NULL };
 static httpd_uri_t uri_rec_clear  = { .uri = "/rec/clear", .method = HTTP_POST, .handler = rec_clear_handler, .user_ctx = NULL };
+static httpd_uri_t uri_event_jpg  = { .uri = "/event.jpg", .method = HTTP_GET,  .handler = event_jpg_handler, .user_ctx = NULL };
 static httpd_uri_t uri_hook_get   = { .uri = "/webhook",   .method = HTTP_GET,  .handler = webhook_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_hook_post  = { .uri = "/webhook",   .method = HTTP_POST, .handler = webhook_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_mask_get   = { .uri = "/mask",      .method = HTTP_GET,  .handler = mask_handler,     .user_ctx = NULL };
@@ -2432,6 +2484,7 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_sysinfo);
         httpd_register_uri_handler(server, &uri_detect);
         httpd_register_uri_handler(server, &uri_rec_clear);
+        httpd_register_uri_handler(server, &uri_event_jpg);
         httpd_register_uri_handler(server, &uri_hook_get);
         httpd_register_uri_handler(server, &uri_hook_post);
         httpd_register_uri_handler(server, &uri_mask_get);
@@ -3012,6 +3065,7 @@ void app_main(void) {
     start_webserver();
     start_stream_webserver();
     /* Loop recorder runs continuously; it idles until enabled via the web UI. */
+    event_lock = xSemaphoreCreateMutex();
     xTaskCreate(rec_task, "rec_task", 6144, NULL, 4, NULL);
 #if CONFIG_BT_NIMBLE_ENABLED
     ble_init();
