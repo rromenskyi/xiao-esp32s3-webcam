@@ -1014,23 +1014,43 @@ static esp_err_t download_handler(httpd_req_t *req) {
     FILE *f = fopen(path, "rb");
     if (!f) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found"); return ESP_FAIL; }
     const char *bn = strrchr(path, '/'); bn = bn ? bn + 1 : path;
-    httpd_resp_set_type(req, strstr(path, ".avi") ? "video/x-msvideo" :
-                             strstr(path, ".wav") ? "audio/wav" : "application/octet-stream");
-    char cd[300]; snprintf(cd, sizeof(cd), "attachment; filename=\"%s\"", bn);
-    httpd_resp_set_hdr(req, "Content-Disposition", cd);
-    /* Disable Nagle for bulk transfer throughput on this socket. */
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    const char *ctype = strstr(path, ".avi") ? "video/x-msvideo" :
+                        strstr(path, ".wav") ? "audio/wav" : "application/octet-stream";
+    /* Send the response raw so it carries a real Content-Length (esp_http_server's
+       chunked path can't) — that gives the browser a size and progress bar. */
     int sock = httpd_req_to_sockfd(req);
     int one = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    const size_t DLBUF = 16384;
+    char hdr[420];
+    int hl = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\n"
+        "Content-Disposition: attachment; filename=\"%s\"\r\n"
+        "Accept-Ranges: none\r\nConnection: close\r\n\r\n", ctype, fsz, bn);
+    if (httpd_send(req, hdr, hl) < 0) { fclose(f); return ESP_FAIL; }
+
+    const size_t DLBUF = 32768;
     char *buf = malloc(DLBUF);
-    if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
-    size_t r; esp_err_t res = ESP_OK;
-    while ((r = fread(buf, 1, DLBUF, f)) > 0) {
-        if (httpd_resp_send_chunk(req, buf, r) != ESP_OK) { res = ESP_FAIL; break; }
+    if (!buf) { fclose(f); return ESP_FAIL; }
+    long remaining = fsz;
+    esp_err_t res = ESP_OK;
+    while (remaining > 0) {
+        size_t want = remaining > (long)DLBUF ? DLBUF : (size_t)remaining;
+        size_t r = fread(buf, 1, want, f);
+        if (r == 0) break;
+        size_t off = 0;
+        while (off < r) {
+            int s = httpd_send(req, buf + off, r - off);
+            if (s <= 0) { res = ESP_FAIL; break; }
+            off += s;
+        }
+        if (res != ESP_OK) break;
+        remaining -= r;
     }
-    free(buf); fclose(f);
-    if (res == ESP_OK) httpd_resp_send_chunk(req, NULL, 0);
+    free(buf);
+    fclose(f);
     return res;
 }
 
@@ -1239,7 +1259,7 @@ static esp_err_t mount_sd_card(bool format_if_mount_failed) {
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     host.flags = SDMMC_HOST_FLAG_1BIT;
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;   /* 20 MHz (SD isn't the download bottleneck) */
 
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.width = 1;
