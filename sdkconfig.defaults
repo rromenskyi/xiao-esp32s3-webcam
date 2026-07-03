@@ -19,7 +19,7 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_OV2640_SUPPORT=y
 
 # LWIP: extra sockets for concurrent MJPEG viewers + two http servers + mDNS
-CONFIG_LWIP_MAX_SOCKETS=20
+CONFIG_LWIP_MAX_SOCKETS=24
 
 # LWIP TCP throughput (much faster file downloads over WiFi)
 CONFIG_LWIP_TCP_WND_DEFAULT=65535

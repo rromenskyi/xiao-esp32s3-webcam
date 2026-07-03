@@ -1005,7 +1005,7 @@ static esp_err_t files_list_handler(httpd_req_t *req) {
     return httpd_resp_sendstr_chunk(req, NULL);
 }
 
-static esp_err_t download_handler(httpd_req_t *req) {
+static esp_err_t do_download(httpd_req_t *req) {
     char q[224], path[160] = "", v[160];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
         httpd_query_key_value(q, "path", v, sizeof(v)) != ESP_OK) {
@@ -1026,6 +1026,9 @@ static esp_err_t download_handler(httpd_req_t *req) {
     int sock = httpd_req_to_sockfd(req);
     int one = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* Never let a stalled client wedge the single port-80 worker forever. */
+    struct timeval sto = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof(sto));
     char hdr[420];
     int hl = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %ld\r\n"
@@ -1054,6 +1057,44 @@ static esp_err_t download_handler(httpd_req_t *req) {
     free(buf);
     fclose(f);
     return res;
+}
+
+/* Downloads run on their own workers so a big/slow transfer never blocks the
+   single port-80 web server (UI, OTA, etc. stay responsive during downloads). */
+#define DL_MAX_CONCURRENT 2
+static QueueHandle_t dl_queue;
+static SemaphoreHandle_t dl_slots;
+
+static void dl_worker(void *arg) {
+    httpd_req_t *req;
+    while (1) {
+        if (xQueueReceive(dl_queue, &req, portMAX_DELAY) == pdTRUE) {
+            do_download(req);
+            httpd_req_async_handler_complete(req);
+            xSemaphoreGive(dl_slots);
+        }
+    }
+}
+
+static esp_err_t download_handler(httpd_req_t *req) {
+    if (!dl_slots || xSemaphoreTake(dl_slots, 0) != pdTRUE) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Too many downloads in progress, try again.");
+    }
+    httpd_req_t *copy = NULL;
+    if (httpd_req_async_handler_begin(req, &copy) != ESP_OK) {
+        xSemaphoreGive(dl_slots);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "download dispatch failed");
+        return ESP_FAIL;
+    }
+    if (xQueueSend(dl_queue, &copy, 0) != pdTRUE) {
+        httpd_req_async_handler_complete(copy);
+        xSemaphoreGive(dl_slots);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "download queue full");
+        return ESP_FAIL;
+    }
+    return ESP_OK;   /* main web worker is free again immediately */
 }
 
 static esp_err_t delete_handler(httpd_req_t *req) {
@@ -2037,14 +2078,21 @@ static httpd_uri_t uri_copy       = { .uri = "/copy",      .method = HTTP_POST, 
 static httpd_uri_t uri_sysinfo    = { .uri = "/sysinfo",   .method = HTTP_GET,  .handler = sysinfo_handler,  .user_ctx = NULL };
 
 static httpd_handle_t start_webserver(void) {
+    /* Async download worker pool: keeps big/slow downloads off the main worker. */
+    dl_slots = xSemaphoreCreateCounting(DL_MAX_CONCURRENT, DL_MAX_CONCURRENT);
+    dl_queue = xQueueCreate(DL_MAX_CONCURRENT, sizeof(httpd_req_t *));
+    if (dl_slots && dl_queue) {
+        for (int i = 0; i < DL_MAX_CONCURRENT; i++)
+            xTaskCreate(dl_worker, "dl_wrk", 4096, NULL, 5, NULL);
+    }
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 22;
     config.max_resp_headers = 8;
     /* index_handler builds sizable HTML on-stack; 4 KB default is too tight. */
     config.stack_size = 8192;
-    /* Short-lived requests; keep socket use small so the LWIP pool is shared
-       with the stream server (port 81) and mDNS without exhaustion. */
-    config.max_open_sockets = 4;
+    /* Room for UI requests + a couple of async downloads at once. */
+    config.max_open_sockets = 7;
     config.lru_purge_enable = true;
     /* Bound blocked I/O so a stalled client on weak WiFi can't wedge the worker. */
     config.recv_wait_timeout = 8;
