@@ -87,15 +87,14 @@ Porting to another ESP32-S3 camera board? See **[docs/HARDWARE.md](docs/HARDWARE
 ## 🗺️ How it works
 
 ```
-                 ┌──────────── Seeed XIAO ESP32S3 Sense ────────────┐
-   OV2640 ─JPEG─▶│ camera task ─┬─▶ MJPEG stream  (:81, async)      │
-                 │              ├─▶ loop recorder ─▶ AVI + .srt ▶ SD │
-   PDM mic ─────▶│ mic task     │        ▲                          │
-                 │              │  motion heuristic ─▶ ESP-DL        │
-                 │              │       person? ─┬─▶ record          │
-                 │  web server (:80) ─ UI/API    └─▶ Telegram / webhook + /event.jpg
-                 └──────────────────────────────────────────────────┘
-                     ▲ WiFi (STA, roams)   ▲ mDNS xiao-cam.local   ▲ OTA
+  OV2640 ──JPEG──┐
+                 ├──►  MJPEG stream  ──────────►  browser   (:81)
+  PDM mic ───────┤
+                 ├──►  motion ──►  ESP-DL person?  ──►  record ──►  AVI + .srt ──►  microSD
+                 │
+                 └──►  Telegram  ·  webhook  ·  /event.jpg
+
+        WiFi (roams)  ·  mDNS xiao-cam.local  ·  OTA-over-WiFi  ·  web UI (:80)
 ```
 
 - **ESP-IDF v6.0**, single-file app (`main/webcam.c`) + a small C++ wrapper for ESP-DL.

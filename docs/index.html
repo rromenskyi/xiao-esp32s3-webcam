@@ -102,14 +102,14 @@
   <div class="wrap">
     <h2>How it works</h2>
     <p class="sub">Single-file ESP-IDF app. Camera in, alerts and recordings out.</p>
-<pre>              &#9484;&#9472;&#9472;&#9472;&#9472; XIAO ESP32S3 Sense &#9472;&#9472;&#9472;&#9472;&#9488;
- OV2640 &#9472;JPEG&#9472;&#9658;&#9474; camera &#9472;&#9516;&#9472;&#9658; MJPEG stream (:81)     &#9474;
-              &#9474;        &#9500;&#9472;&#9658; loop recorder &#9658; AVI+.srt &#9658; SD
- PDM mic &#9472;&#9472;&#9472;&#9472;&#9658;&#9474; mic     &#9474;    &#9650;                      &#9474;
-              &#9474;        &#9474;  motion &#9658; ESP-DL person? &#9472;&#9658; record
-              &#9474; web UI/API (:80)  &#9492;&#9472;&#9658; Telegram / webhook + /event.jpg
-              &#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
-   WiFi (roams) &#183; mDNS xiao-cam.local &#183; OTA-over-WiFi</pre>
+<pre>  OV2640 ──JPEG──┐
+                 ├──►  MJPEG stream  ──────────►  browser   (:81)
+  PDM mic ───────┤
+                 ├──►  motion ──►  ESP-DL person?  ──►  record ──►  AVI + .srt ──►  microSD
+                 │
+                 └──►  Telegram  ·  webhook  ·  /event.jpg
+
+        WiFi (roams)  ·  mDNS xiao-cam.local  ·  OTA-over-WiFi  ·  web UI (:80)</pre>
   </div>
 </section>
 
