@@ -82,8 +82,12 @@ Open Telegram, message **@BotFather** → `/newbot` → follow the prompts → i
 Web UI → **Recording** card → **Telegram**: paste the **token** + **chat id** →
 **Save all** → **Send test**. A photo should land in your chat within a couple of seconds.
 
-That's it — on each detection you get a photo captioned
+That's it — on each detection you get **a photo of the moment, then a short animated
+GIF** (~1 s, built on-device and played inline by Telegram), both captioned
 `front-door: person at 2026-07-04 01:00:31 (33%)`. No server, no relay.
+
+> The GIF is a small 160×120 preview encoded right on the ESP32-S3 — Telegram plays it
+> inline, giving you "video" without any H.264/transcoding the S3 can't do.
 
 > The token is stored on the device (NVS + SD backup) and never shown back in the UI.
 > Works alongside the generic webhook — set either, both, or neither.

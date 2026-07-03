@@ -18,6 +18,7 @@
 #include "img_converters.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "gifenc.h"
 #include "person_detect.h"
 #include "esp_http_server.h"
 #include "driver/gpio.h"
@@ -1008,38 +1009,96 @@ static void save_event_snapshot(camera_fb_t *fb) {
     xSemaphoreGive(event_lock);
 }
 
-/* Send a photo with caption to Telegram directly (multipart, HTTPS). */
-static void telegram_send_photo(const char *caption, const uint8_t *jpg, size_t jlen) {
-    if (!tg_token[0] || !tg_chat[0] || !jpg || !jlen) return;
+/* Send a media file with caption to Telegram directly (multipart, HTTPS). */
+static void telegram_send_media(const char *method, const char *field, const char *caption,
+                                const uint8_t *data, size_t dlen, const char *filename, const char *mime) {
+    if (!tg_token[0] || !tg_chat[0] || !data || !dlen) return;
     const char *bnd = "----xiaocamBOUNDARY7f3";
-    char head[512], tail[64];
+    char head[560], tail[64];
     int hn = snprintf(head, sizeof(head),
         "--%s\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n%s\r\n"
         "--%s\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n%s\r\n"
-        "--%s\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"event.jpg\"\r\n"
-        "Content-Type: image/jpeg\r\n\r\n", bnd, tg_chat, bnd, caption, bnd);
+        "--%s\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+        "Content-Type: %s\r\n\r\n", bnd, tg_chat, bnd, caption, bnd, field, filename, mime);
     int tn = snprintf(tail, sizeof(tail), "\r\n--%s--\r\n", bnd);
-    size_t total = (size_t)hn + jlen + tn;
+    size_t total = (size_t)hn + dlen + tn;
     uint8_t *body = heap_caps_malloc(total, MALLOC_CAP_SPIRAM);
     if (!body) return;
     memcpy(body, head, hn);
-    memcpy(body + hn, jpg, jlen);
-    memcpy(body + hn + jlen, tail, tn);
+    memcpy(body + hn, data, dlen);
+    memcpy(body + hn + dlen, tail, tn);
     char url[128], ctype[80];
-    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendPhoto", tg_token);
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/%s", tg_token, method);
     snprintf(ctype, sizeof(ctype), "multipart/form-data; boundary=%s", bnd);
     esp_http_client_config_t cfg = { .url = url, .method = HTTP_METHOD_POST,
-                                     .timeout_ms = 12000, .crt_bundle_attach = esp_crt_bundle_attach };
+                                     .timeout_ms = 15000, .crt_bundle_attach = esp_crt_bundle_attach };
     esp_http_client_handle_t c = esp_http_client_init(&cfg);
     if (c) {
         esp_http_client_set_header(c, "Content-Type", ctype);
         esp_http_client_set_post_field(c, (const char *)body, total);
         esp_err_t r = esp_http_client_perform(c);
-        ESP_LOGI(TAG, "telegram sendPhoto -> %s (HTTP %d)", esp_err_to_name(r),
+        ESP_LOGI(TAG, "telegram %s -> %s (HTTP %d)", method, esp_err_to_name(r),
                  r == ESP_OK ? esp_http_client_get_status_code(c) : -1);
         esp_http_client_cleanup(c);
     }
     free(body);
+}
+static void telegram_send_photo(const char *caption, const uint8_t *jpg, size_t jlen) {
+    telegram_send_media("sendPhoto", "photo", caption, jpg, jlen, "event.jpg", "image/jpeg");
+}
+
+/* Capture a short burst and encode a small animated GIF to `path`. */
+#define GIF_FRAMES   10
+#define GIF_FRAME_MS 100
+static bool make_event_gif(const char *path) {
+    if (!sd_ready || !camera_ready) return false;
+    static uint8_t pal[3 * 64]; static bool pal_init = false;
+    if (!pal_init) {   /* 64-color 2-2-2 RGB palette (bounds the LZW trie to ~1 MB) */
+        for (int i = 0; i < 64; i++) { pal[i*3] = ((i>>4)&3)*85; pal[i*3+1] = ((i>>2)&3)*85; pal[i*3+2] = (i&3)*85; }
+        pal_init = true;
+    }
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) return false;
+    int w = fb->width / 4, h = fb->height / 4;
+    esp_camera_fb_return(fb);
+    if (w <= 0 || h <= 0 || (w * h) > 240 * 180) return false;
+    uint8_t *rgb = heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM);
+    if (!rgb) return false;
+    ge_GIF *gif = ge_new_gif(path, w, h, pal, 6, 0);
+    if (!gif) { free(rgb); return false; }
+    for (int f = 0; f < GIF_FRAMES; f++) {
+        camera_fb_t *cf = esp_camera_fb_get();
+        if (cf) {
+            if (jpg2rgb565(cf->buf, cf->len, rgb, JPG_SCALE_4X)) {
+                uint16_t *px = (uint16_t *)rgb;
+                for (int i = 0; i < w * h; i++) {
+                    uint16_t p = px[i];
+                    int r = ((p >> 11) & 0x1f) >> 3, g = ((p >> 5) & 0x3f) >> 4, b = (p & 0x1f) >> 3;
+                    gif->frame[i] = (uint8_t)((r << 4) | (g << 2) | b);
+                }
+            }
+            esp_camera_fb_return(cf);
+        }
+        ge_add_frame(gif, 10);   /* 100 ms/frame playback */
+        vTaskDelay(pdMS_TO_TICKS(GIF_FRAME_MS));
+    }
+    ge_close_gif(gif);
+    free(rgb);
+    return true;
+}
+static void telegram_send_gif(const char *caption, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz > 0 && sz <= 6 * 1024 * 1024) {
+        uint8_t *buf = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+        if (buf) {
+            if (fread(buf, 1, sz, f) == (size_t)sz)
+                telegram_send_media("sendAnimation", "animation", caption, buf, sz, "event.gif", "image/gif");
+            free(buf);
+        }
+    }
+    fclose(f);
 }
 
 /* Fire the alarm webhook (runs in its own task so it never blocks recording). */
@@ -1080,6 +1139,8 @@ static void webhook_task(void *arg) {
             if (fb) { if (fb->format == PIXFORMAT_JPEG) { buf = heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM); if (buf) { memcpy(buf, fb->buf, fb->len); blen = fb->len; } } esp_camera_fb_return(fb); }
         }
         if (buf) { telegram_send_photo(caption, buf, blen); free(buf); }
+        if (make_event_gif("/sdcard/event.gif"))     /* then an animated preview */
+            telegram_send_gif(caption, "/sdcard/event.gif");
     }
     free(event);
     vTaskDelete(NULL);
