@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XIAO ESP32S3 Smart Webcam</title>
+<meta name="description" content="A $14 ESP32-S3 board turned into a smart security camera: MJPEG stream, on-device AI person detection, motion recording to SD, and Telegram alerts with a snapshot. No cloud.">
+<style>
+  :root{
+    --bg:#0b1016;--panel:#131b24;--panel2:#0f161d;--line:#223040;
+    --text:#e8eef4;--muted:#8da0b4;--accent:#16c0d8;--accent2:#0e7d94;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:1040px;margin:0 auto;padding:0 20px}
+  .btn{display:inline-block;padding:12px 22px;border-radius:12px;font-weight:600;
+    border:1px solid var(--line);color:var(--text);transition:.15s}
+  .btn:hover{text-decoration:none;transform:translateY(-1px)}
+  .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));
+    color:#04222a;border-color:transparent}
+  /* hero */
+  header{padding:76px 0 60px;text-align:center;
+    background:radial-gradient(120% 90% at 50% -10%,rgba(22,192,216,.16),transparent 60%)}
+  .logo{width:60px;height:60px;border-radius:16px;margin:0 auto 22px;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));
+    display:grid;place-items:center;font-size:30px;box-shadow:0 12px 40px rgba(22,192,216,.35)}
+  h1{font-size:clamp(30px,6vw,50px);line-height:1.1;margin:0 0 14px;letter-spacing:-.02em}
+  h1 .g{background:linear-gradient(120deg,var(--accent),#7ce0ee);-webkit-background-clip:text;
+    background-clip:text;-webkit-text-fill-color:transparent}
+  .lede{font-size:clamp(16px,2.5vw,20px);color:var(--muted);max-width:660px;margin:0 auto 28px}
+  .cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+  .pill{display:inline-flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:26px}
+  .pill span{font-size:12px;color:var(--muted);border:1px solid var(--line);
+    border-radius:999px;padding:5px 12px;background:var(--panel2)}
+  /* sections */
+  section{padding:52px 0;border-top:1px solid var(--line)}
+  h2{font-size:clamp(22px,4vw,30px);margin:0 0 8px;letter-spacing:-.01em}
+  .sub{color:var(--muted);margin:0 0 30px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:22px}
+  .card .ic{font-size:24px;margin-bottom:10px}
+  .card h3{margin:0 0 6px;font-size:17px}
+  .card p{margin:0;color:var(--muted);font-size:14.5px}
+  /* how */
+  pre{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:18px;
+    overflow-x:auto;color:#bfe9f1;font-size:13px;line-height:1.5}
+  .steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:18px;margin-top:8px}
+  .step{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px}
+  .step .n{width:30px;height:30px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);
+    display:grid;place-items:center;font-weight:700;color:var(--accent);margin-bottom:12px}
+  .specs{width:100%;border-collapse:collapse;font-size:14.5px}
+  .specs td{padding:10px 12px;border-bottom:1px solid var(--line);color:var(--muted)}
+  .specs td:first-child{color:var(--text);font-weight:600;width:130px}
+  .specs tr:last-child td{border-bottom:0}
+  footer{padding:40px 0;border-top:1px solid var(--line);color:var(--muted);text-align:center;font-size:14px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="logo">📷</div>
+    <h1>A $14 board.<br>A <span class="g">smart security camera.</span></h1>
+    <p class="lede">Open-source ESP-IDF firmware for the Seeed XIAO ESP32S3 Sense —
+      live MJPEG stream, <b>on-device AI person detection</b>, motion recording to SD,
+      and <b>Telegram alerts with a snapshot</b>. All local. No cloud, no subscription.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/rromenskyi/xiao-esp32s3-webcam">View on GitHub →</a>
+      <a class="btn" href="#quickstart">Quick start</a>
+    </div>
+    <div class="pill">
+      <span>ESP32-S3</span><span>8 MB PSRAM</span><span>OV2640</span>
+      <span>ESP-DL person detect</span><span>OTA-over-WiFi</span><span>MIT</span>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="sub">Everything a security cam should — running entirely on the board.</p>
+    <div class="grid">
+      <div class="card"><div class="ic">📹</div><h3>Multi-viewer stream</h3><p>MJPEG over WiFi with a responsive dark UI: resolution, quality, brightness, mirror/flip — live. Several viewers at once.</p></div>
+      <div class="card"><div class="ic">🧠</div><h3>AI person detection</h3><p>ESP-DL <code>pedestrian_detect</code> confirms a real person before recording. Curtains, light and pets stop false-triggering it.</p></div>
+      <div class="card"><div class="ic">🎬</div><h3>Motion recording</h3><p>Records to microSD only on motion, each event its own timestamped clip, with audio, a disk budget, and crash-safe checkpoints.</p></div>
+      <div class="card"><div class="ic">🔔</div><h3>Telegram alerts</h3><p>Sends the snapshot of the moment — with a caption — straight to your chat over HTTPS. Built in, no relay or server.</p></div>
+      <div class="card"><div class="ic">🎭</div><h3>Ignore zones</h3><p>Paint a mask over a window or a busy street so motion there is ignored. Tune the AI confidence to taste.</p></div>
+      <div class="card"><div class="ic">🕑</div><h3>Timestamps done right</h3><p>A per-second <code>.srt</code> sidecar shows the real time in any player — full quality, no lossy re-encode.</p></div>
+      <div class="card"><div class="ic">📡</div><h3>Zero-touch ops</h3><p>SoftAP provisioning, mDNS <code>xiao-cam.local</code>, multi-network roaming, NTP, and system stats.</p></div>
+      <div class="card"><div class="ic">⬆️</div><h3>OTA forever</h3><p>One USB flash, then update over WiFi from the web UI. Dual 3.5 MB slots.</p></div>
+      <div class="card"><div class="ic">💾</div><h3>Drop-in provisioning</h3><p>Back up every setting to the SD card; drop it into a fresh board and it configures itself.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>How it works</h2>
+    <p class="sub">Single-file ESP-IDF app. Camera in, alerts and recordings out.</p>
+<pre>              &#9484;&#9472;&#9472;&#9472;&#9472; XIAO ESP32S3 Sense &#9472;&#9472;&#9472;&#9472;&#9488;
+ OV2640 &#9472;JPEG&#9472;&#9658;&#9474; camera &#9472;&#9516;&#9472;&#9658; MJPEG stream (:81)     &#9474;
+              &#9474;        &#9500;&#9472;&#9658; loop recorder &#9658; AVI+.srt &#9658; SD
+ PDM mic &#9472;&#9472;&#9472;&#9472;&#9658;&#9474; mic     &#9474;    &#9650;                      &#9474;
+              &#9474;        &#9474;  motion &#9658; ESP-DL person? &#9472;&#9658; record
+              &#9474; web UI/API (:80)  &#9492;&#9472;&#9658; Telegram / webhook + /event.jpg
+              &#9492;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9472;&#9488;
+   WiFi (roams) &#183; mDNS xiao-cam.local &#183; OTA-over-WiFi</pre>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <h2>Quick start</h2>
+    <p class="sub">Flash once over USB, then it lives on your WiFi.</p>
+    <div class="steps">
+      <div class="step"><div class="n">1</div><h3>Flash</h3><p>Build with ESP-IDF v6.0 and flash over USB once. See the build guide.</p></div>
+      <div class="step"><div class="n">2</div><h3>Provision</h3><p>Join the <code>XIAO-SETUP</code> WiFi, pick your network, save.</p></div>
+      <div class="step"><div class="n">3</div><h3>Open</h3><p>Browse to <code>http://xiao-cam.local/</code>. Stream is live.</p></div>
+      <div class="step"><div class="n">4</div><h3>Arm it</h3><p>Turn on recording + AI + Telegram in the Recording card. Done.</p></div>
+    </div>
+    <p style="margin-top:26px"><a class="btn primary" href="https://github.com/rromenskyi/xiao-esp32s3-webcam/blob/main/BUILD_INSTRUCTIONS.md">Build &amp; flash guide →</a></p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Hardware</h2>
+    <p class="sub">The whole thing runs on one thumb-sized board.</p>
+    <table class="specs">
+      <tr><td>Board</td><td><a href="https://www.seeedstudio.com/XIAO-ESP32S3-Sense-p-5639.html">Seeed XIAO ESP32S3 Sense</a> (Amazon B0C69FFVHH)</td></tr>
+      <tr><td>SoC</td><td>ESP32-S3 @ 240 MHz &#183; 8 MB PSRAM (octal) &#183; 8 MB flash</td></tr>
+      <tr><td>Camera</td><td>OV2640 via LCD_CAM, JPEG</td></tr>
+      <tr><td>Mic</td><td>PDM &#183; CLK 42 / DATA 41 &#183; I2S PDM RX, 16 kHz mono</td></tr>
+      <tr><td>microSD</td><td>SDMMC 1-bit &#183; CLK 7 / CMD 9 / D0 8</td></tr>
+    </table>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    Open source under the MIT license &#183;
+    <a href="https://github.com/rromenskyi/xiao-esp32s3-webcam">GitHub</a> &#183;
+    Built with ESP-IDF, esp32-camera &amp; ESP-DL
+  </div>
+</footer>
+
+</body>
+</html>

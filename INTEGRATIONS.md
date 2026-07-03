@@ -64,9 +64,23 @@ many cameras and show the snapshot inline.
 
 The camera sends the **snapshot with a caption straight to your chat** over HTTPS.
 
-1. Message **@BotFather** → `/newbot` → copy the **bot token**.
-2. Message your new bot once (say "hi"), then message **@userinfobot** → copy your **chat id**.
-3. Web UI → **Recording** card → **Telegram**: paste the token + chat id → **Save all** → **Send test**.
+**Step 1 — create the bot & get the token**
+Open Telegram, message **@BotFather** → `/newbot` → follow the prompts → it gives you a
+**token** like `123456789:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxx`.
+
+**Step 2 — get your chat id**
+- **Personal chat (alerts to yourself):** message **@userinfobot** — it replies with your
+  numeric `id` (e.g. `123456789`). *(Alternatives: @RawDataBot, @getidsbot.)*
+- **Or, the manual way:** send any message to **your** bot, then open
+  `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and find
+  `"chat":{"id":123456789}`.
+- **Group chat:** add the bot to the group, post a message there, then open the same
+  `getUpdates` URL — the group id is a **negative** number (e.g. `-1001234567890`).
+  (You may need to disable the bot's group privacy in @BotFather → `/setprivacy`.)
+
+**Step 3 — enter it on the camera**
+Web UI → **Recording** card → **Telegram**: paste the **token** + **chat id** →
+**Save all** → **Send test**. A photo should land in your chat within a couple of seconds.
 
 That's it — on each detection you get a photo captioned
 `front-door: person at 2026-07-04 01:00:31 (33%)`. No server, no relay.
