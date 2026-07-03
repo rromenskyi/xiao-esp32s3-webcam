@@ -910,9 +910,9 @@ static void rec_task(void *arg) {
 
         snprintf(rec_status, sizeof(rec_status), "REC %s (%u frames%s)", cur,
                  (unsigned)w.vframes, have_mic ? "+audio" : "");
-        /* Crash-safety: every ~5 s make the on-disk clip valid + flush to card,
-           so a power cut / card pull loses at most a few seconds, not the clip. */
-        if (w.vframes % (REC_TARGET_FPS * 5) == 0) avi_checkpoint(&w);
+        /* Crash-safety: every ~2 s make the on-disk clip valid + flush to card,
+           so a power cut / card pull loses at most ~2 s, not the whole clip. */
+        if (w.vframes % (REC_TARGET_FPS * 2) == 0) avi_checkpoint(&w);
         uint32_t seg_frames = (uint32_t)rec_seg_min * 60 * REC_TARGET_FPS;
         if (w.vframes >= seg_frames || w.movi_bytes >= REC_SEG_HARD_BYTES) {
             avi_end(&w); open = false; rec_enforce_budget();
