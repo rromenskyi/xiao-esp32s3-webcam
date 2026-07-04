@@ -255,7 +255,7 @@ static camera_config_t camera_config = {
     .pixel_format = PIXFORMAT_JPEG,
     .frame_size = FRAMESIZE_VGA,
     .jpeg_quality = 12,
-    .fb_count = 2,
+    .fb_count = 3,   /* extra buffer eases contention (rec + stream + detect + GIF) */
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
@@ -351,10 +351,10 @@ static void sd_config_save_all(void) {
     fprintf(f, "srt=%d\n", srt_enabled ? 1 : 0);
     fprintf(f, "evh=%d\n", event_hooks ? 1 : 0);
     fprintf(f, "hook=%s\n", webhook_url);
-    fprintf(f, "uipass=%s\n", ui_pass);
     fprintf(f, "cname=%s\n", cam_name);
-    fprintf(f, "tgtok=%s\n", tg_token);
     fprintf(f, "tgchat=%s\n", tg_chat);
+    /* Secrets (admin password `uipass`, Telegram token `tgtok`) are intentionally
+       NOT written to removable SD — kept in NVS only. */
     fprintf(f, "mlc=%d\n", motion_ml ? 1 : 0);
     fprintf(f, "pconf=%d\n", motion_pconf);
     sensor_t *cs = esp_camera_sensor_get();
@@ -1786,11 +1786,8 @@ static esp_err_t detect_handler(httpd_req_t *req) {
     if (!auth_ok(req)) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     if (!ml_ready || !camera_ready) return httpd_resp_sendstr(req, "{\"ready\":false}");
-    char q[32], v[8];
-    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
-        httpd_query_key_value(q, "fmt", v, sizeof(v)) == ESP_OK) person_set_pixfmt(atoi(v));
-    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
-        httpd_query_key_value(q, "thr", v, sizeof(v)) == ESP_OK) person_set_thr_pct(atoi(v));
+    /* Read-only: no query mutators — they used to change the live detector threshold
+       that the recording motion-gate relies on. */
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) return httpd_resp_sendstr(req, "{\"ready\":true,\"error\":\"no frame\"}");
     int64_t t0 = esp_timer_get_time();
@@ -1877,8 +1874,27 @@ static int b64decode(const char *in, unsigned char *out, int outmax) {
     }
     return n;
 }
-/* Returns true if allowed; otherwise sends a 401 and returns false. */
+/* Constant-time string compare (avoid password timing leaks). */
+static bool ct_eq(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    unsigned char diff = (unsigned char)(la ^ lb);
+    for (size_t i = 0; i < la; i++) diff |= (unsigned char)(a[i] ^ b[i % (lb ? lb : 1)]);
+    return diff == 0;
+}
+/* Returns true if allowed; otherwise sends 401/403 and returns false.
+   Also blocks cross-origin state-changing (POST) requests — CSRF defense. */
 static bool auth_ok(httpd_req_t *req) {
+    if (req->method == HTTP_POST) {                     /* CSRF: reject cross-origin POSTs */
+        char origin[128];
+        if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) == ESP_OK) {
+            char host[64] = "";
+            httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));
+            if (!host[0] || !strstr(origin, host)) {
+                httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "cross-origin request blocked");
+                return false;
+            }
+        }
+    }
     if (!ui_pass[0]) return true;                       /* open when no password set */
     char hdr[128];
     if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) == ESP_OK &&
@@ -1887,7 +1903,7 @@ static bool auth_ok(httpd_req_t *req) {
         int dl = b64decode(hdr + 6, dec, sizeof(dec) - 1);
         dec[dl] = 0;
         const char *pw = strchr((char *)dec, ':');      /* user:pass — user is ignored */
-        if (pw && strcmp(pw + 1, ui_pass) == 0) return true;
+        if (pw && ct_eq(pw + 1, ui_pass)) return true;
     }
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"xiao-cam\"");
@@ -1918,7 +1934,9 @@ static esp_err_t webhook_handler(httpd_req_t *req) {
         if (r >= 0) { buf[r] = 0; strlcpy(webhook_url, buf, sizeof(webhook_url)); sanitize_field(webhook_url); sys_cfg_save(); }
     }
     char q[256], v[96];
-    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+    /* Setters only on POST (auth_ok already blocked cross-origin POSTs) — a GET
+       must never change the camera name / Telegram token / fire a test (CSRF). */
+    if (req->method == HTTP_POST && httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
         bool ch = false;
         if (httpd_query_key_value(q, "name", v, sizeof(v)) == ESP_OK && v[0]) { urldecode(v); sanitize_field(v); strlcpy(cam_name, v, sizeof(cam_name)); ch = true; }
         if (httpd_query_key_value(q, "tgtok", v, sizeof(v)) == ESP_OK) { urldecode(v); sanitize_field(v); if (v[0]) { strlcpy(tg_token, v, sizeof(tg_token)); ch = true; } }
@@ -1958,7 +1976,7 @@ static esp_err_t rec_clear_handler(httpd_req_t *req) {
 static esp_err_t mask_handler(httpd_req_t *req) {
     if (!auth_ok(req)) return ESP_OK;
     char q[128], v[64];
-    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
+    if (req->method == HTTP_POST && httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
         httpd_query_key_value(q, "grid", v, sizeof(v)) == ESP_OK) {
         if (strlen(v) == MASK_COLS * MASK_ROWS) {
             bool ok = true;
@@ -2717,7 +2735,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
             "cam.src=stream;raw.href=stream;"
             "cam.onerror=()=>{setTimeout(()=>{cam.src=stream+'?t='+Date.now();},1500);};"
             "const ids=['framesize','quality','brightness','contrast','saturation','hmirror','vflip'];"
-            "async function setOne(id){const e=document.getElementById(id);const v=e.type==='checkbox'?(e.checked?1:0):e.value;try{await fetch('/control?'+id+'='+encodeURIComponent(v));}catch(_){}}"
+            "async function setOne(id){const e=document.getElementById(id);const v=e.type==='checkbox'?(e.checked?1:0):e.value;try{await fetch('/control?'+id+'='+encodeURIComponent(v),{method:'POST'});}catch(_){}}"
             "ids.forEach(id=>{const e=document.getElementById(id);e&&e.addEventListener('change',()=>setOne(id));});"
             "['quality','brightness','contrast','saturation'].forEach(id=>{const e=document.getElementById(id),v=document.getElementById(id+'V');e.addEventListener('input',()=>{v.textContent=e.value;});});"
             "const fs=document.getElementById('framesize');fs.addEventListener('change',()=>{res.textContent=fs.selectedOptions[0].dataset.dim;});"
@@ -2726,7 +2744,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
     }
     httpd_resp_sendstr_chunk(req,
         "const _f=document.getElementById('formatSd');if(_f)_f.onclick=async()=>{if(!confirm('Format SD card? This erases the card.'))return;const r=await fetch('/format_sd',{method:'POST'});alert(await r.text());location.reload();};"
-        "const _r=document.getElementById('reboot');if(_r)_r.onclick=()=>{if(confirm('Reboot board?'))fetch('/reboot');};"
+        "const _r=document.getElementById('reboot');if(_r)_r.onclick=()=>{if(confirm('Reboot board?'))fetch('/reboot',{method:'POST'});};"
         "const _rec=document.getElementById('rec');if(_rec)_rec.onclick=async()=>{const st=document.getElementById('micState'),pl=document.getElementById('player');_rec.disabled=true;const t0=st.textContent;st.textContent='Recording 5s...';try{const r=await fetch('/audio.wav?secs=5');const b=await r.blob();pl.src=URL.createObjectURL(b);pl.play().catch(()=>{});st.textContent='Captured '+(b.size>>10)+' KB';}catch(e){st.textContent='Record failed';}_rec.disabled=false;setTimeout(()=>{st.textContent=t0;},4000);};"
         "const _fl=document.getElementById('flash');if(_fl)_fl.onclick=()=>{const f=document.getElementById('fw').files[0],st=document.getElementById('otaState'),bar=document.getElementById('otabar');if(!f){st.textContent='Pick a .bin first';return;}if(!confirm('Flash '+f.name+' ('+(f.size>>10)+' KB) over WiFi?'))return;_fl.disabled=true;const x=new XMLHttpRequest();x.open('POST','/ota');x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);bar.style.width=p+'%';st.textContent='Uploading '+p+'%';}};x.onload=()=>{st.textContent=x.status===200?'Flashed. Rebooting... reload in ~10s.':'OTA failed: '+x.responseText;if(x.status===200){bar.style.width='100%';setTimeout(()=>location.reload(),12000);}else _fl.disabled=false;};x.onerror=()=>{st.textContent='Upload error';_fl.disabled=false;};x.send(f);};"
         "var _pb=document.getElementById('pullBtn'),_ps=document.getElementById('pullState');"
@@ -2746,7 +2764,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "var _pc=document.getElementById('recPconf');if(document.activeElement!==_pc){_pc.value=d.pconf;document.getElementById('recPconfV').textContent=d.pconf+'% (now '+(d.mlscore>=0?d.mlscore+'%':'-')+')';}"
         "document.getElementById('recSrt').checked=d.srt;document.getElementById('recEvh').checked=d.evh;"
         "document.getElementById('hookState').textContent=d.webhook?'active':'off';"
-        "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const live=cl.name===d.active;const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML='<span>'+(live?'● ':'')+cl.name+' ('+((cl.size/1048576)|0)+' MB)'+(cl.mtime?'  ·  '+cl.mtime:'')+(live?'  · recording':'')+'</span>';if(!live){const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);}c.appendChild(r);});}catch(e){}}"
+        "function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');}"
+        "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const live=cl.name===d.active;const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML='<span>'+(live?'● ':'')+esc(cl.name)+' ('+((cl.size/1048576)|0)+' MB)'+(cl.mtime?'  ·  '+cl.mtime:'')+(live?'  · recording':'')+'</span>';if(!live){const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);}c.appendChild(r);});}catch(e){}}"
         "recBtn.onclick=async()=>{await fetch('/rec?on='+(recBtn.textContent.startsWith('Start')?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "document.getElementById('recAudio').onchange=async e=>{await fetch('/rec?audio='+(e.target.checked?1:0),{method:'POST'});};"
         "recPct.addEventListener('input',()=>document.getElementById('recPctV').textContent=recPct.value+'%');"
@@ -2777,9 +2796,9 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "function fbSize(n){return n>1048576?(n/1048576).toFixed(1)+' MB':((n/1024)|0)+' KB';}"
         "async function fbLoad(p){try{const r=await fetch('/files?dir='+encodeURIComponent(p));if(!r.ok)return;const d=await r.json();fbCur=d.dir;document.getElementById('fbPath').textContent=d.dir;"
         "let h='<table class=fb><thead><tr><th>Name</th><th>Modified</th><th style=text-align:right>Size</th><th style=text-align:right>Actions</th></tr></thead><tbody>';"
-        "d.entries.sort((a,b)=>(b.dir-a.dir)||a.name.localeCompare(b.name)).forEach(en=>{const fp=d.dir+'/'+en.name;const nm=en.dir?('[dir] '+en.name):en.name;let a;"
-        "if(en.dir){a='<button class=lnk data-a=cd data-p=\"'+fp+'\">open</button>';}else{a='<a class=lnk href=\"/download?path='+encodeURIComponent(fp)+'\">get</a><button class=lnk data-a=ren data-p=\"'+fp+'\">ren</button><button class=lnk data-a=cp data-p=\"'+fp+'\">copy</button><button class=\"lnk danger\" data-a=del data-p=\"'+fp+'\">del</button>';}"
-        "h+='<tr><td'+(en.dir?' class=lnk data-a=cd data-p=\"'+fp+'\" style=cursor:pointer':'')+'>'+nm+'</td><td style=color:var(--muted)>'+(en.mtime||'')+'</td><td style=\"text-align:right;color:var(--muted)\">'+(en.dir?'':fbSize(en.size))+'</td><td style=\"text-align:right;white-space:nowrap\">'+a+'</td></tr>';});"
+        "d.entries.sort((a,b)=>(b.dir-a.dir)||a.name.localeCompare(b.name)).forEach(en=>{const fp=d.dir+'/'+en.name;const nm=en.dir?('[dir] '+en.name):en.name;const efp=esc(fp),enm=esc(nm);let a;"
+        "if(en.dir){a='<button class=lnk data-a=cd data-p=\"'+efp+'\">open</button>';}else{a='<a class=lnk href=\"/download?path='+encodeURIComponent(fp)+'\">get</a><button class=lnk data-a=ren data-p=\"'+efp+'\">ren</button><button class=lnk data-a=cp data-p=\"'+efp+'\">copy</button><button class=\"lnk danger\" data-a=del data-p=\"'+efp+'\">del</button>';}"
+        "h+='<tr><td'+(en.dir?' class=lnk data-a=cd data-p=\"'+efp+'\" style=cursor:pointer':'')+'>'+enm+'</td><td style=color:var(--muted)>'+(en.mtime||'')+'</td><td style=\"text-align:right;color:var(--muted)\">'+(en.dir?'':fbSize(en.size))+'</td><td style=\"text-align:right;white-space:nowrap\">'+a+'</td></tr>';});"
         "h+='</tbody></table>';const L=document.getElementById('fbList');L.innerHTML=h;L.querySelectorAll('[data-a]').forEach(el=>{el.onclick=()=>fbAct(el.dataset.a,el.dataset.p);});}catch(e){}}"
         "async function fbAct(a,fp){const nm=fp.substring(fp.lastIndexOf('/')+1),dir=fp.substring(0,fp.lastIndexOf('/'));"
         "if(a==='cd'){fbLoad(fp);}"
@@ -2823,14 +2842,14 @@ static httpd_uri_t uri_stream = {
 
 static httpd_uri_t uri_control = {
     .uri = "/control",
-    .method = HTTP_GET,
+    .method = HTTP_POST,   /* POST-only: state-changing, avoid GET/img CSRF */
     .handler = control_handler,
     .user_ctx = NULL
 };
 
 static httpd_uri_t uri_reboot = {
     .uri = "/reboot",
-    .method = HTTP_GET,
+    .method = HTTP_POST,   /* POST-only: avoid <img src=.../reboot> CSRF */
     .handler = reboot_handler,
     .user_ctx = NULL
 };
@@ -3172,8 +3191,10 @@ static esp_err_t prov_save_handler(httpd_req_t *req) {
                        "<p><small>If this page doesn't redirect, reconnect to your WiFi.</small></p>"
                        "<meta http-equiv='refresh' content='5; url=/'>"
                        "</body></html>";
-    char resp_buf[512];
-    snprintf(resp_buf, sizeof(resp_buf), resp, ssid);
+    char ssid_esc[sizeof(((wifi_cred_t *)0)->ssid) * 6 + 1];
+    html_escape_string(ssid_esc, sizeof(ssid_esc), ssid);   /* reflected -> escape */
+    char resp_buf[768];
+    snprintf(resp_buf, sizeof(resp_buf), resp, ssid_esc);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, resp_buf, HTTPD_RESP_USE_STRLEN);
 
