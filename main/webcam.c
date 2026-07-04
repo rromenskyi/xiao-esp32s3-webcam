@@ -449,6 +449,8 @@ static bool sd_config_load(void) {
     }
     if (cur_ssid[0]) { wifi_creds_add(cur_ssid, ""); added = true; }
     fclose(f);
+    /* SD config is user-editable — scrub values that later go into JSON. */
+    sanitize_field(cam_name); sanitize_field(webhook_url); sanitize_field(tg_chat); sanitize_field(tg_token);
     return added;
 }
 
@@ -781,6 +783,9 @@ static void sys_cfg_load(void) {
     size_t ml = sizeof(motion_mask);
     nvs_get_str(h, "mask", motion_mask, &ml);
     nvs_close(h);
+    /* Strip quotes/backslash/control from any value that later lands in JSON —
+       HTTP setters sanitize, but NVS may hold values written by an older build. */
+    sanitize_field(cam_name); sanitize_field(webhook_url); sanitize_field(tg_chat); sanitize_field(tg_token);
 }
 static void sys_cfg_save(void) {
     nvs_handle_t h;

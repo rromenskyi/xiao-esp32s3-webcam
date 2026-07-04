@@ -20,10 +20,14 @@ static Node *new_node(uint16_t key, int degree) {
     return node;
 }
 
+static void del_trie(Node *root, int degree);
 static Node *new_trie(int degree, int *nkeys) {
     Node *root = new_node(0, degree);
-    for (*nkeys = 0; *nkeys < degree; (*nkeys)++)
+    if (!root) { *nkeys = 0; return NULL; }
+    for (*nkeys = 0; *nkeys < degree; (*nkeys)++) {
         root->children[*nkeys] = new_node(*nkeys, degree);
+        if (!root->children[*nkeys]) { del_trie(root, degree); *nkeys = 0; return NULL; }  /* OOM */
+    }
     *nkeys += 2;   /* skip clear code and stop code */
     return root;
 }
@@ -107,6 +111,11 @@ static void end_key(ge_GIF *gif) {
 void ge_add_frame(ge_GIF *gif, uint16_t delay) {
     int nkeys, key_size, degree = 1 << gif->depth;
 
+    /* Build the dictionary first — if we're out of memory, skip this frame entirely
+       (write nothing) rather than emit a half-written frame or crash on a NULL deref. */
+    Node *root = new_trie(degree, &nkeys);
+    if (!root) return;
+
     /* Graphic Control Extension (for the frame delay) */
     if (delay > 0 || gif->nframes) {
         fputc('!', gif->file); fputc(0xF9, gif->file); fputc(4, gif->file);
@@ -124,7 +133,6 @@ void ge_add_frame(ge_GIF *gif, uint16_t delay) {
     int min_code_size = gif->depth < 2 ? 2 : gif->depth;
     fputc(min_code_size, gif->file);
 
-    Node *root = new_trie(degree, &nkeys);
     key_size = min_code_size + 1;
     put_key(gif, degree, key_size);        /* clear code */
 
@@ -137,14 +145,28 @@ void ge_add_frame(ge_GIF *gif, uint16_t delay) {
             node = child;
         } else {
             put_key(gif, node->key, key_size);
+            Node *nn = NULL;
             if (nkeys < 0x1000) {
                 if (nkeys == (1 << key_size)) key_size++;
-                node->children[pixel] = new_node(nkeys++, degree);
+                nn = new_node(nkeys, degree);       /* may be NULL under memory pressure */
+            }
+            if (nn) {
+                node->children[pixel] = nn;
+                nkeys++;
             } else {
+                /* Dictionary full, OR out of memory growing it — reset it. Resetting
+                   keeps the encoder and decoder dictionaries in sync (a silently
+                   dropped node would corrupt the stream). */
                 put_key(gif, degree, key_size);        /* clear code */
                 del_trie(root, degree);
                 root = new_trie(degree, &nkeys);
                 key_size = min_code_size + 1;
+                if (!root) {   /* OOM even for the reset: close the frame cleanly and stop */
+                    put_key(gif, degree + 1, key_size); /* stop code */
+                    end_key(gif);
+                    gif->nframes++;
+                    return;
+                }
             }
             node = root->children[pixel];
         }
