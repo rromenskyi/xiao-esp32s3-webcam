@@ -1097,7 +1097,10 @@ static bool make_event_gif(const char *path) {
         camera_fb_t *cf = esp_camera_fb_get();
         bool good = false;
         if (cf) {
-            if (cf->width / 2 == w && cf->height / 2 == h &&
+            /* Only use a COMPLETE JPEG (ends with the EOI marker) — under load the
+               sensor sometimes emits a truncated frame that decodes to a torn image. */
+            bool whole = cf->len >= 2 && cf->buf[cf->len - 2] == 0xFF && cf->buf[cf->len - 1] == 0xD9;
+            if (cf->width / 2 == w && cf->height / 2 == h && whole &&
                 jpg2rgb565(cf->buf, cf->len, rgb, JPG_SCALE_2X)) {
                 uint16_t *px = (uint16_t *)rgb;
                 for (int i = 0; i < w * h; i++) {
