@@ -91,6 +91,7 @@ Query-string params; only supplied ones change, each validated + persisted.
 | `ml` | 0/1 | confirm motion with ML person detector |
 | `pconf` | int | person-confidence % to trigger, 10–90 |
 | `srt` | 0/1 | write `.srt` sidecar |
+| `evh` | 0/1 | send start/stop event webhooks (stop carries the clip URL) |
 
 ### `GET /rec/list` (port 80)
 Clips + full status:
@@ -155,6 +156,9 @@ The alert payload POSTed on an event:
 ```json
 {"event":"person","camera":"front-door","time":"2026-07-04 01:00:31","score":33,"photo":"http://<ip>/event.jpg"}
 ```
+With **Start/stop webhooks** (`/rec?evh=1`) enabled, each event emits `event:"start"` then,
+when the clip is finalized, `event:"stop"` with a `clip` download URL (see INTEGRATIONS.md).
+Telegram (if configured) sends the photo + an animated GIF preview on the start.
 
 ---
 

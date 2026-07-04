@@ -10,11 +10,28 @@ When motion (or a person, if AI confirm is on) is detected, the camera sends a
 
 | field    | meaning |
 |----------|---------|
-| `event`  | `motion` (heuristic only), `person` (ML-confirmed), or `test` |
+| `event`  | `motion` (heuristic only), `person` (ML-confirmed), `test`, or `start`/`stop` (see below) |
 | `camera` | the name you set (so a shared bot knows which camera fired) |
 | `time`   | wall-clock (needs NTP on), else empty |
 | `score`  | person-detection confidence %, or `-1` when AI confirm is off |
 | `photo`  | URL of a **snapshot of the moment it triggered** (empty on `test`). Also at `/event.jpg`. |
+
+### Start/stop webhooks (for archiving)
+
+Enable **"Start/stop webhooks"** in the Recording card to get a matched pair per event
+instead of a single alert:
+
+- On detection **start** → `{"event":"start","camera":…,"time":…,"score":…,"photo":…}`
+- When the event ends and the clip is finalized → **stop**, carrying a **download URL**
+  for the AVI so an archiver can pull it:
+
+```json
+{ "event": "stop", "camera": "front-door", "time": "2026-07-04 01:00:39",
+  "clip": "http://10.0.0.228/download?path=/sdcard/rec/clip-20260704-010031.avi" }
+```
+
+The `stop` webhook is generic-webhook only (no Telegram spam). Typical use: your server
+keys on `start` to begin, then on `stop` downloads `clip` into an archive.
 
 **Set it up:** web UI → **Recording** card → **Camera name** + **Alarm webhook** → **Save** → **Test**.
 The camera must be able to reach the webhook URL. **Note:** `photo` is a LAN address —

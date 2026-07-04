@@ -2,7 +2,12 @@
    (https://github.com/lecram/gifenc), public domain, ported to FILE*. */
 #include <stdlib.h>
 #include <string.h>
+#include "esp_heap_caps.h"
 #include "gifenc.h"
+
+/* The LZW trie can reach ~2 MB — allocate it (and the frame buffers) from PSRAM,
+   not the tiny internal heap. free() works on PSRAM allocations in ESP-IDF. */
+#define GIF_ALLOC(sz) heap_caps_calloc(1, (sz), MALLOC_CAP_SPIRAM)
 
 typedef struct Node {
     uint16_t key;
@@ -10,7 +15,7 @@ typedef struct Node {
 } Node;
 
 static Node *new_node(uint16_t key, int degree) {
-    Node *node = calloc(1, sizeof(*node) + degree * sizeof(Node *));
+    Node *node = GIF_ALLOC(sizeof(*node) + degree * sizeof(Node *));
     if (node) node->key = key;
     return node;
 }
@@ -27,7 +32,7 @@ static Node *new_trie(int degree, int *nkeys) {
    would blow the task stack if freed recursively. */
 static void del_trie(Node *root, int degree) {
     if (!root) return;
-    Node **stack = malloc(4098 * sizeof(Node *));
+    Node **stack = GIF_ALLOC(4098 * sizeof(Node *));
     if (!stack) return;   /* leak rather than crash on OOM */
     int sp = 0;
     stack[sp++] = root;
@@ -55,7 +60,7 @@ static void put_loop(ge_GIF *gif, uint16_t loop) {
 
 ge_GIF *ge_new_gif(const char *fname, uint16_t width, uint16_t height,
                    uint8_t *palette, int depth, int loop) {
-    ge_GIF *gif = calloc(1, sizeof(*gif) + 2 * (size_t)width * height);
+    ge_GIF *gif = GIF_ALLOC(sizeof(*gif) + 2 * (size_t)width * height);
     if (!gif) return NULL;
     gif->file = fopen(fname, "wb");
     if (!gif->file) { free(gif); return NULL; }

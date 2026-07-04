@@ -198,6 +198,7 @@ static char webhook_url[160] = "";         /* POST here on a motion/person event
 static char cam_name[32] = "xiao-cam";     /* identifies this camera in alerts */
 static char tg_token[64] = "";             /* Telegram bot token (from @BotFather) */
 static char tg_chat[24]  = "";             /* Telegram chat id (from @userinfobot) */
+static bool event_hooks = false;           /* POST start + stop(+clip URL) webhooks per event */
 static int64_t webhook_last = 0;           /* rate-limit: last fire time (us) */
 static uint8_t *event_jpg = NULL;          /* snapshot of the moment a detection fired */
 static size_t event_jpg_len = 0, event_jpg_cap = 0;
@@ -342,6 +343,7 @@ static void sd_config_save_all(void) {
     fprintf(f, "msens=%d\n", motion_sens);
     fprintf(f, "mask=%s\n", motion_mask);
     fprintf(f, "srt=%d\n", srt_enabled ? 1 : 0);
+    fprintf(f, "evh=%d\n", event_hooks ? 1 : 0);
     fprintf(f, "hook=%s\n", webhook_url);
     fprintf(f, "cname=%s\n", cam_name);
     fprintf(f, "tgtok=%s\n", tg_token);
@@ -392,6 +394,7 @@ static bool sd_config_load(void) {
         else if (strcmp(k, "msens") == 0)       { int s = atoi(v); if (s >= 1 && s <= 30) motion_sens = s; }
         else if (strcmp(k, "mask") == 0)        { if (strlen(v) == MASK_COLS * MASK_ROWS) strlcpy(motion_mask, v, sizeof(motion_mask)); }
         else if (strcmp(k, "srt") == 0)         srt_enabled = atoi(v) ? true : false;
+        else if (strcmp(k, "evh") == 0)         event_hooks = atoi(v) ? true : false;
         else if (strcmp(k, "hook") == 0)        strlcpy(webhook_url, v, sizeof(webhook_url));
         else if (strcmp(k, "cname") == 0)       { if (v[0]) strlcpy(cam_name, v, sizeof(cam_name)); }
         else if (strcmp(k, "tgtok") == 0)       strlcpy(tg_token, v, sizeof(tg_token));
@@ -733,6 +736,7 @@ static void sys_cfg_load(void) {
     if (nvs_get_i32(h, "mlc", &v) == ESP_OK) motion_ml = v ? true : false;
     if (nvs_get_i32(h, "pconf", &v) == ESP_OK && v >= 10 && v <= 90) motion_pconf = v;
     if (nvs_get_i32(h, "srt", &v) == ESP_OK) srt_enabled = v ? true : false;
+    if (nvs_get_i32(h, "evh", &v) == ESP_OK) event_hooks = v ? true : false;
     size_t hl = sizeof(webhook_url);
     nvs_get_str(h, "hook", webhook_url, &hl);
     size_t nl = sizeof(cam_name);
@@ -753,6 +757,7 @@ static void sys_cfg_save(void) {
     nvs_set_i32(h, "mlc", motion_ml ? 1 : 0);
     nvs_set_i32(h, "pconf", motion_pconf);
     nvs_set_i32(h, "srt", srt_enabled ? 1 : 0);
+    nvs_set_i32(h, "evh", event_hooks ? 1 : 0);
     nvs_set_str(h, "hook", webhook_url);
     nvs_set_str(h, "cname", cam_name);
     nvs_set_str(h, "tgtok", tg_token);
@@ -1052,29 +1057,29 @@ static void telegram_send_photo(const char *caption, const uint8_t *jpg, size_t 
 #define GIF_FRAME_MS 100
 static bool make_event_gif(const char *path) {
     if (!sd_ready || !camera_ready) return false;
-    static uint8_t pal[3 * 64]; static bool pal_init = false;
-    if (!pal_init) {   /* 64-color 2-2-2 RGB palette (bounds the LZW trie to ~1 MB) */
-        for (int i = 0; i < 64; i++) { pal[i*3] = ((i>>4)&3)*85; pal[i*3+1] = ((i>>2)&3)*85; pal[i*3+2] = (i&3)*85; }
+    static uint8_t pal[3 * 128]; static bool pal_init = false;
+    if (!pal_init) {   /* 128-color 2-3-2 palette (extra green levels; trie ~2 MB) */
+        for (int i = 0; i < 128; i++) { pal[i*3] = ((i>>5)&3)*85; pal[i*3+1] = ((i>>2)&7)*36; pal[i*3+2] = (i&3)*85; }
         pal_init = true;
     }
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) return false;
-    int w = fb->width / 4, h = fb->height / 4;
+    int w = fb->width / 2, h = fb->height / 2;
     esp_camera_fb_return(fb);
-    if (w <= 0 || h <= 0 || (w * h) > 240 * 180) return false;
+    if (w <= 0 || h <= 0 || (w * h) > 400 * 300) return false;   /* up to SVGA/2 */
     uint8_t *rgb = heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM);
     if (!rgb) return false;
-    ge_GIF *gif = ge_new_gif(path, w, h, pal, 6, 0);
+    ge_GIF *gif = ge_new_gif(path, w, h, pal, 7, 0);
     if (!gif) { free(rgb); return false; }
     for (int f = 0; f < GIF_FRAMES; f++) {
         camera_fb_t *cf = esp_camera_fb_get();
         if (cf) {
-            if (jpg2rgb565(cf->buf, cf->len, rgb, JPG_SCALE_4X)) {
+            if (jpg2rgb565(cf->buf, cf->len, rgb, JPG_SCALE_2X)) {
                 uint16_t *px = (uint16_t *)rgb;
                 for (int i = 0; i < w * h; i++) {
                     uint16_t p = px[i];
-                    int r = ((p >> 11) & 0x1f) >> 3, g = ((p >> 5) & 0x3f) >> 4, b = (p & 0x1f) >> 3;
-                    gif->frame[i] = (uint8_t)((r << 4) | (g << 2) | b);
+                    int r = ((p >> 11) & 0x1f) >> 3, g = ((p >> 5) & 0x3f) >> 3, b = (p & 0x1f) >> 3;
+                    gif->frame[i] = (uint8_t)((r << 5) | (g << 2) | b);
                 }
             }
             esp_camera_fb_return(cf);
@@ -1156,6 +1161,34 @@ static void webhook_notify(const char *event) {
     if (ev && xTaskCreate(webhook_task, "webhook", 8192, ev, 5, NULL) != pdPASS) free(ev);
 }
 
+/* POST a lightweight "stop" webhook with a download URL for the finalized clip
+   (for archiving). Webhook-only, no Telegram. */
+static void event_stop_task(void *arg) {
+    char *clip = (char *)arg;
+    char ts[24] = "";
+    if (time_synced) { time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm); }
+    char url[144] = "";
+    if (device_ip[0] && clip[0]) snprintf(url, sizeof(url), "http://%s/download?path=/sdcard/rec/%s", device_ip, clip);
+    char body[360];
+    snprintf(body, sizeof(body), "{\"event\":\"stop\",\"camera\":\"%s\",\"time\":\"%s\",\"clip\":\"%s\"}", cam_name, ts, url);
+    esp_http_client_config_t cfg = { .url = webhook_url, .method = HTTP_METHOD_POST, .timeout_ms = 5000, .crt_bundle_attach = esp_crt_bundle_attach };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (c) {
+        esp_http_client_set_header(c, "Content-Type", "application/json");
+        esp_http_client_set_post_field(c, body, strlen(body));
+        esp_err_t r = esp_http_client_perform(c);
+        ESP_LOGI(TAG, "webhook stop -> %s", r == ESP_OK ? "ok" : esp_err_to_name(r));
+        esp_http_client_cleanup(c);
+    }
+    free(clip);
+    vTaskDelete(NULL);
+}
+static void event_notify_stop(const char *clipname) {
+    if (!event_hooks || !webhook_url[0]) return;
+    char *c = strdup(clipname ? clipname : "");
+    if (c && xTaskCreate(event_stop_task, "evstop", 5120, c, 5, NULL) != pdPASS) free(c);
+}
+
 /* Write a subtitle sidecar (clip.srt) with one wall-clock caption per second, so
    a player (VLC) shows the real time while playing. Zero cost to the video. */
 static void write_clip_srt(const char *avi_name, time_t start, int frames, int fps) {
@@ -1219,14 +1252,14 @@ static void rec_task(void *arg) {
                     /* Heuristic fired. If ML is on, only record when it's a person. */
                     bool trigger = (motion_ml && ml_ready) ? (person_in_frame(fb) != 0) : true;
                     if (trigger) {
-                        if (mcool == 0) { save_event_snapshot(fb); webhook_notify(motion_ml && ml_ready ? "person" : "motion"); }  /* new event */
+                        if (mcool == 0) { save_event_snapshot(fb); webhook_notify(event_hooks ? "start" : (motion_ml && ml_ready ? "person" : "motion")); }  /* new event */
                         mcool = REC_TARGET_FPS * 5;
                     }
                 }
             }
             if (mcool > 0) { mcool--; motion_active = true; } else motion_active = false;
             if (!motion_active) {
-                if (open) { close_clip(&w); open = false; }
+                if (open) { event_notify_stop(rec_cur_file); close_clip(&w); open = false; }
                 esp_camera_fb_return(fb);
                 snprintf(rec_status, sizeof(rec_status), "armed - waiting for motion");
                 vTaskDelay(pdMS_TO_TICKS(1000 / REC_TARGET_FPS));
@@ -1296,6 +1329,7 @@ static esp_err_t rec_toggle_handler(httpd_req_t *req) {
         if (httpd_query_key_value(q, "ml", v, sizeof(v)) == ESP_OK) { motion_ml = atoi(v) ? true : false; sys_cfg_save(); }
         if (httpd_query_key_value(q, "pconf", v, sizeof(v)) == ESP_OK) { int p = atoi(v); if (p >= 10 && p <= 90) { motion_pconf = p; person_set_thr_pct(p); sys_cfg_save(); } }
         if (httpd_query_key_value(q, "srt", v, sizeof(v)) == ESP_OK) { srt_enabled = atoi(v) ? true : false; sys_cfg_save(); }
+        if (httpd_query_key_value(q, "evh", v, sizeof(v)) == ESP_OK) { event_hooks = atoi(v) ? true : false; sys_cfg_save(); }
     }
     char body[200];
     snprintf(body, sizeof(body), "{\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d}",
@@ -1330,11 +1364,11 @@ static esp_err_t rec_list_handler(httpd_req_t *req) {
         closedir(d);
     }
     char tail[500];
-    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d,\"mactive\":%s,\"mscore\":%d,\"ml\":%s,\"mlready\":%s,\"pconf\":%d,\"mlscore\":%d,\"srt\":%s,\"webhook\":%s,\"used\":%llu,\"total\":%llu,\"active\":\"%s\",\"status\":\"%s\"}",
+    snprintf(tail, sizeof(tail), "],\"enabled\":%s,\"audio\":%s,\"pct\":%d,\"seg\":%d,\"motion\":%s,\"msens\":%d,\"mactive\":%s,\"mscore\":%d,\"ml\":%s,\"mlready\":%s,\"pconf\":%d,\"mlscore\":%d,\"srt\":%s,\"evh\":%s,\"webhook\":%s,\"used\":%llu,\"total\":%llu,\"active\":\"%s\",\"status\":\"%s\"}",
              rec_enabled ? "true" : "false", rec_audio ? "true" : "false", rec_budget_pct, rec_seg_min,
              motion_enabled ? "true" : "false", motion_sens, motion_active ? "true" : "false", motion_last_score,
              motion_ml ? "true" : "false", ml_ready ? "true" : "false", motion_pconf, ml_ready ? person_last_score_pct() : -1,
-             srt_enabled ? "true" : "false", webhook_url[0] ? "true" : "false",
+             srt_enabled ? "true" : "false", event_hooks ? "true" : "false", webhook_url[0] ? "true" : "false",
              (unsigned long long)used, (unsigned long long)total, rec_cur_file, rec_status);
     httpd_resp_sendstr_chunk(req, tail);
     return httpd_resp_sendstr_chunk(req, NULL);
@@ -2352,6 +2386,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "<div class='ctl' style='margin-top:10px'><div class='row'><label for='hookUrl'>Alarm webhook</label><span class='val' id='hookState'></span></div>"
         "<input id='hookUrl' type='text' placeholder='https://your-server/alert' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)'>"
         "<div style='color:var(--muted);font-size:12px;margin-top:4px'>Generic: POSTs {event,camera,time,score,photo} on detection.</div></div>"
+        "<div class='ctl switch' style='margin-top:8px'><label for='recEvh'>Start/stop webhooks (stop carries the clip URL)</label><label class='tgl'><input id='recEvh' type='checkbox'><span class='sl'></span></label></div>"
         "<div class='ctl' style='margin-top:10px'><div class='row'><label>Telegram (sends the photo directly)</label><span class='val' id='tgState'></span></div>"
         "<input id='tgTok' type='password' placeholder='bot token from @BotFather' autocomplete='off' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);margin-bottom:6px'>"
         "<input id='tgChat' type='text' placeholder='chat id from @userinfobot' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)'></div>"
@@ -2482,7 +2517,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "document.getElementById('recMotion').checked=d.motion;var _ms=document.getElementById('recMsens');if(document.activeElement!==_ms){_ms.value=d.msens;document.getElementById('recMsensV').textContent=d.msens+'%';}"
         "var _ml=document.getElementById('recMl');_ml.checked=d.ml;_ml.disabled=!d.mlready;_ml.parentElement.style.opacity=d.mlready?'1':'.5';"
         "var _pc=document.getElementById('recPconf');if(document.activeElement!==_pc){_pc.value=d.pconf;document.getElementById('recPconfV').textContent=d.pconf+'% (now '+(d.mlscore>=0?d.mlscore+'%':'-')+')';}"
-        "document.getElementById('recSrt').checked=d.srt;"
+        "document.getElementById('recSrt').checked=d.srt;document.getElementById('recEvh').checked=d.evh;"
         "document.getElementById('hookState').textContent=d.webhook?'active':'off';"
         "const c=document.getElementById('clips');c.innerHTML='';d.clips.sort((a,b)=>b.name.localeCompare(a.name)).forEach(cl=>{const live=cl.name===d.active;const r=document.createElement('div');r.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--muted);font-size:13px';r.innerHTML='<span>'+(live?'● ':'')+cl.name+' ('+((cl.size/1048576)|0)+' MB)'+(cl.mtime?'  ·  '+cl.mtime:'')+(live?'  · recording':'')+'</span>';if(!live){const a=document.createElement('a');a.className='btn';a.style.cssText='flex:0;min-width:90px;height:32px';a.textContent='Download';a.href='/download?path=/sdcard/rec/'+encodeURIComponent(cl.name);r.appendChild(a);}c.appendChild(r);});}catch(e){}}"
         "recBtn.onclick=async()=>{await fetch('/rec?on='+(recBtn.textContent.startsWith('Start')?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
@@ -2495,6 +2530,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "document.getElementById('recMl').onchange=e=>{fetch('/rec?ml='+(e.target.checked?1:0),{method:'POST'});setTimeout(recRefresh,300);};"
         "var recPconf=document.getElementById('recPconf');recPconf.addEventListener('input',()=>document.getElementById('recPconfV').textContent=recPconf.value+'%');recPconf.addEventListener('change',()=>fetch('/rec?pconf='+recPconf.value,{method:'POST'}));"
         "document.getElementById('recSrt').onchange=e=>fetch('/rec?srt='+(e.target.checked?1:0),{method:'POST'});"
+        "document.getElementById('recEvh').onchange=e=>fetch('/rec?evh='+(e.target.checked?1:0),{method:'POST'});"
         "fetch('/webhook').then(r=>r.json()).then(d=>{document.getElementById('hookUrl').value=d.url||'';document.getElementById('camName').value=d.name||'';document.getElementById('tgChat').value=d.chat||'';document.getElementById('tgState').textContent=d.tg?'saved':'off';if(d.tg)document.getElementById('tgTok').placeholder='saved — leave blank to keep';}).catch(()=>{});"
         "function hookSaveAll(){return fetch('/webhook?name='+encodeURIComponent(document.getElementById('camName').value)+'&tgtok='+encodeURIComponent(document.getElementById('tgTok').value)+'&tgchat='+encodeURIComponent(document.getElementById('tgChat').value),{method:'POST',body:document.getElementById('hookUrl').value});}"
         "document.getElementById('hookSave').onclick=async()=>{await hookSaveAll();document.getElementById('tgTok').value='';recRefresh();};"
