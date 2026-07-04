@@ -1198,9 +1198,32 @@ static volatile bool ota_pull_busy = false;
 
 static void ota_pull_task(void *arg) {
     ota_pull_busy = true;
-    snprintf(ota_pull_status, sizeof(ota_pull_status), "checking GitHub...");
-    esp_http_client_config_t http = { .url = FW_NIGHTLY_URL, .crt_bundle_attach = esp_crt_bundle_attach,
-                                      .timeout_ms = 20000, .keep_alive_enable = true };
+    snprintf(ota_pull_status, sizeof(ota_pull_status), "resolving GitHub URL...");
+    /* GitHub release URLs 302-redirect to a ~900-char signed CDN URL that esp_https_ota
+       won't follow across origins. Resolve it manually to the direct URL first. */
+    static char final_url[1400];
+    strlcpy(final_url, FW_NIGHTLY_URL, sizeof(final_url));
+    esp_http_client_config_t rc = { .url = FW_NIGHTLY_URL, .crt_bundle_attach = esp_crt_bundle_attach,
+                                    .timeout_ms = 20000, .buffer_size = 4096, .user_agent = "xiao-esp32s3-webcam" };
+    esp_http_client_handle_t rh = esp_http_client_init(&rc);
+    int sc = 0;
+    esp_err_t oe = rh ? esp_http_client_open(rh, 0) : ESP_FAIL;
+    if (oe != ESP_OK) {
+        snprintf(ota_pull_status, sizeof(ota_pull_status), "open failed: %s", esp_err_to_name(oe));
+        if (rh) esp_http_client_cleanup(rh);
+        ota_pull_busy = false; vTaskDelete(NULL); return;
+    }
+    esp_http_client_fetch_headers(rh);
+    sc = esp_http_client_get_status_code(rh);
+    if (sc == 301 || sc == 302 || sc == 303 || sc == 307 || sc == 308)
+        esp_http_client_set_redirection(rh);           /* client url -> Location */
+    esp_http_client_get_url(rh, final_url, sizeof(final_url));
+    esp_http_client_close(rh);
+    esp_http_client_cleanup(rh);
+    snprintf(ota_pull_status, sizeof(ota_pull_status), "downloading (was HTTP %d)...", sc);
+    esp_http_client_config_t http = { .url = final_url, .crt_bundle_attach = esp_crt_bundle_attach,
+                                      .timeout_ms = 20000, .keep_alive_enable = true, .buffer_size = 4096,
+                                      .user_agent = "xiao-esp32s3-webcam" };
     esp_https_ota_config_t cfg = { .http_config = &http };
     esp_https_ota_handle_t h = NULL;
     esp_err_t err = esp_https_ota_begin(&cfg, &h);

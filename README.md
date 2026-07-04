@@ -106,8 +106,8 @@ Porting to another ESP32-S3 camera board? See **[docs/HARDWARE.md](docs/HARDWARE
 
 ## 🧭 Roadmap
 
+- [x] **Pull-OTA / auto-update** — the board self-updates from the GitHub `nightly` release
 - [ ] Wake-word ("OK ESP") → stream to your own Whisper + LLM
-- [ ] Pull-OTA: check a URL + SHA-256 and self-update (nightly / stable channels)
 - [ ] Snapshot-thumbnail timeline in the file browser
 
 ---
