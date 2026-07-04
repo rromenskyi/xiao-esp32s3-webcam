@@ -83,6 +83,9 @@ static esp_err_t rec_clear_handler(httpd_req_t *req);
 static esp_err_t webhook_handler(httpd_req_t *req);
 static esp_err_t event_jpg_handler(httpd_req_t *req);
 static esp_err_t update_handler(httpd_req_t *req);
+static esp_err_t auth_handler(httpd_req_t *req);
+static bool auth_ok(httpd_req_t *req);
+static void sanitize_field(char *s);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
@@ -201,6 +204,7 @@ static char cam_name[32] = "xiao-cam";     /* identifies this camera in alerts *
 static char tg_token[64] = "";             /* Telegram bot token (from @BotFather) */
 static char tg_chat[24]  = "";             /* Telegram chat id (from @userinfobot) */
 static bool event_hooks = false;           /* POST start + stop(+clip URL) webhooks per event */
+static char ui_pass[48] = "";              /* if set, all endpoints require HTTP Basic auth */
 static int64_t webhook_last = 0;           /* rate-limit: last fire time (us) */
 static uint8_t *event_jpg = NULL;          /* snapshot of the moment a detection fired */
 static size_t event_jpg_len = 0, event_jpg_cap = 0;
@@ -347,6 +351,7 @@ static void sd_config_save_all(void) {
     fprintf(f, "srt=%d\n", srt_enabled ? 1 : 0);
     fprintf(f, "evh=%d\n", event_hooks ? 1 : 0);
     fprintf(f, "hook=%s\n", webhook_url);
+    fprintf(f, "uipass=%s\n", ui_pass);
     fprintf(f, "cname=%s\n", cam_name);
     fprintf(f, "tgtok=%s\n", tg_token);
     fprintf(f, "tgchat=%s\n", tg_chat);
@@ -398,6 +403,7 @@ static bool sd_config_load(void) {
         else if (strcmp(k, "srt") == 0)         srt_enabled = atoi(v) ? true : false;
         else if (strcmp(k, "evh") == 0)         event_hooks = atoi(v) ? true : false;
         else if (strcmp(k, "hook") == 0)        strlcpy(webhook_url, v, sizeof(webhook_url));
+        else if (strcmp(k, "uipass") == 0)      strlcpy(ui_pass, v, sizeof(ui_pass));
         else if (strcmp(k, "cname") == 0)       { if (v[0]) strlcpy(cam_name, v, sizeof(cam_name)); }
         else if (strcmp(k, "tgtok") == 0)       strlcpy(tg_token, v, sizeof(tg_token));
         else if (strcmp(k, "tgchat") == 0)      strlcpy(tg_chat, v, sizeof(tg_chat));
@@ -534,6 +540,7 @@ static void wav_header(uint8_t *h, uint32_t sample_rate, uint32_t data_len) {
 }
 
 static esp_err_t audio_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     if (!mic_ready) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "text/plain");
@@ -619,6 +626,7 @@ static esp_err_t audio_handler(httpd_req_t *req) {
 
 /* Push OTA: POST a raw .bin to /ota, written to the inactive OTA slot, then reboot. */
 static esp_err_t ota_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
     if (!update) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition available");
@@ -741,6 +749,7 @@ static void sys_cfg_load(void) {
     if (nvs_get_i32(h, "evh", &v) == ESP_OK) event_hooks = v ? true : false;
     size_t hl = sizeof(webhook_url);
     nvs_get_str(h, "hook", webhook_url, &hl);
+    size_t upl = sizeof(ui_pass); nvs_get_str(h, "uipass", ui_pass, &upl);
     size_t nl = sizeof(cam_name);
     nvs_get_str(h, "cname", cam_name, &nl);
     size_t ttl = sizeof(tg_token); nvs_get_str(h, "tgtok", tg_token, &ttl);
@@ -761,6 +770,7 @@ static void sys_cfg_save(void) {
     nvs_set_i32(h, "srt", srt_enabled ? 1 : 0);
     nvs_set_i32(h, "evh", event_hooks ? 1 : 0);
     nvs_set_str(h, "hook", webhook_url);
+    nvs_set_str(h, "uipass", ui_pass);
     nvs_set_str(h, "cname", cam_name);
     nvs_set_str(h, "tgtok", tg_token);
     nvs_set_str(h, "tgchat", tg_chat);
@@ -1397,6 +1407,7 @@ static void rec_task(void *arg) {
 }
 
 static esp_err_t rec_toggle_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char q[64], v[16];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
         if (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK) { rec_enabled = atoi(v) ? true : false; rec_cfg_save(); }
@@ -1419,6 +1430,7 @@ static esp_err_t rec_toggle_handler(httpd_req_t *req) {
 }
 
 static esp_err_t rec_list_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     uint64_t total = (sd_ready && sd_card) ? (uint64_t)sd_card->csd.capacity * sd_card->csd.sector_size : 0;
     uint64_t used = 0;
@@ -1471,6 +1483,7 @@ static bool is_active_clip(const char *path) {
 }
 
 static esp_err_t files_list_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char q[192], dir[128] = "/sdcard";
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
         char v[128]; if (httpd_query_key_value(q, "dir", v, sizeof(v)) == ESP_OK) url_decode(dir, v, sizeof(dir));
@@ -1573,6 +1586,7 @@ static void dl_worker(void *arg) {
 }
 
 static esp_err_t download_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     if (!dl_slots || xSemaphoreTake(dl_slots, 0) != pdTRUE) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "text/plain");
@@ -1594,6 +1608,7 @@ static esp_err_t download_handler(httpd_req_t *req) {
 }
 
 static esp_err_t delete_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char q[224], path[160] = "", v[160];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) != ESP_OK ||
         httpd_query_key_value(q, "path", v, sizeof(v)) != ESP_OK) {
@@ -1618,6 +1633,7 @@ static bool sd_two_paths(httpd_req_t *req, char *src, size_t sl, char *dst, size
 }
 
 static esp_err_t rename_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char src[180], dst[180];
     if (!sd_two_paths(req, src, sizeof(src), dst, sizeof(dst))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad src/dst"); return ESP_FAIL;
@@ -1629,6 +1645,7 @@ static esp_err_t rename_handler(httpd_req_t *req) {
 }
 
 static esp_err_t copy_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char src[180], dst[180];
     if (!sd_two_paths(req, src, sizeof(src), dst, sizeof(dst))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad src/dst"); return ESP_FAIL;
@@ -1652,6 +1669,7 @@ static esp_err_t copy_handler(httpd_req_t *req) {
 }
 
 static esp_err_t sysinfo_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     esp_chip_info_t chip;
     esp_chip_info(&chip);
     const char *model = chip.model == CHIP_ESP32S3 ? "ESP32-S3" : "ESP32";
@@ -1683,6 +1701,7 @@ static esp_err_t sysinfo_handler(httpd_req_t *req) {
 
 /* Back up the current config (incl. WiFi creds from NVS) to the SD card. */
 static esp_err_t config_backup_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     if (!sd_ready) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No SD card mounted"); return ESP_FAIL; }
     if (wifi_cred_count == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No saved WiFi to back up");
@@ -1694,6 +1713,7 @@ static esp_err_t config_backup_handler(httpd_req_t *req) {
 }
 
 static esp_err_t wifi_list_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr_chunk(req, "{\"networks\":[");
     for (int i = 0; i < wifi_cred_count; i++) {
@@ -1722,6 +1742,7 @@ static esp_err_t wifi_list_handler(httpd_req_t *req) {
 }
 
 static esp_err_t wifi_add_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char q[256], ssid[33] = "", pass[64] = "", v[160];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
         if (httpd_query_key_value(q, "ssid", v, sizeof(v)) == ESP_OK) url_decode(ssid, v, sizeof(ssid));
@@ -1738,6 +1759,7 @@ static esp_err_t wifi_add_handler(httpd_req_t *req) {
 }
 
 static esp_err_t wifi_del_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char q[128], ssid[33] = "", v[96];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
         httpd_query_key_value(q, "ssid", v, sizeof(v)) == ESP_OK) {
@@ -1758,6 +1780,7 @@ static esp_err_t wifi_del_handler(httpd_req_t *req) {
 
 /* Debug: run the person detector on one live frame and report result + timing. */
 static esp_err_t detect_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     httpd_resp_set_type(req, "application/json");
     if (!ml_ready || !camera_ready) return httpd_resp_sendstr(req, "{\"ready\":false}");
     char q[32], v[8];
@@ -1778,8 +1801,24 @@ static esp_err_t detect_handler(httpd_req_t *req) {
     return httpd_resp_sendstr(req, body);
 }
 
+/* Optional UI password: GET returns {locked}; POST body sets it ("" disables). */
+static esp_err_t auth_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
+    if (req->method == HTTP_POST) {
+        char buf[64];
+        int len = req->content_len < (int)sizeof(buf) - 1 ? req->content_len : (int)sizeof(buf) - 1;
+        int r = len > 0 ? httpd_req_recv(req, buf, len) : 0;
+        if (r >= 0) { buf[r] = 0; strlcpy(ui_pass, buf, sizeof(ui_pass)); sanitize_field(ui_pass); sys_cfg_save(); }
+    }
+    char body[40];
+    snprintf(body, sizeof(body), "{\"locked\":%s}", ui_pass[0] ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
 /* Pull-OTA: POST starts a self-update from GitHub; GET returns status + version. */
 static esp_err_t update_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     if (req->method == HTTP_POST) ota_pull_start();
     char body[160];
     snprintf(body, sizeof(body), "{\"version\":\"%s\",\"status\":\"%s\",\"busy\":%s}",
@@ -1790,6 +1829,7 @@ static esp_err_t update_handler(httpd_req_t *req) {
 
 /* Serve the snapshot of the last detection event (for the alarm photo). */
 static esp_err_t event_jpg_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     if (!event_lock || xSemaphoreTake(event_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no event snapshot yet");
         return ESP_OK;
@@ -1816,6 +1856,43 @@ static void sanitize_field(char *s) {
     }
     *d = '\0';
 }
+/* Optional HTTP Basic auth: when ui_pass is set, every endpoint requires it. */
+static int b64val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+static int b64decode(const char *in, unsigned char *out, int outmax) {
+    int n = 0, bits = 0, val = 0, v;
+    for (; *in && *in != '='; in++) {
+        if ((v = b64val(*in)) < 0) continue;
+        val = (val << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; if (n < outmax) out[n++] = (val >> bits) & 0xFF; }
+    }
+    return n;
+}
+/* Returns true if allowed; otherwise sends a 401 and returns false. */
+static bool auth_ok(httpd_req_t *req) {
+    if (!ui_pass[0]) return true;                       /* open when no password set */
+    char hdr[128];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) == ESP_OK &&
+        strncmp(hdr, "Basic ", 6) == 0) {
+        unsigned char dec[96];
+        int dl = b64decode(hdr + 6, dec, sizeof(dec) - 1);
+        dec[dl] = 0;
+        const char *pw = strchr((char *)dec, ':');      /* user:pass — user is ignored */
+        if (pw && strcmp(pw + 1, ui_pass) == 0) return true;
+    }
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"xiao-cam\"");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, "Authentication required");
+    return false;
+}
+
 static int hexv(char c) { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; }
 static void urldecode(char *s) {
     char *d = s; int a, b;
@@ -1830,6 +1907,7 @@ static void urldecode(char *s) {
 /* Alarm config: GET returns url/name/chat/tg; POST body sets webhook url; query
    params name/tgtok/tgchat set those; ?test=1 fires a test alert. */
 static esp_err_t webhook_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     if (req->method == HTTP_POST) {
         char buf[200];
         int len = req->content_len < (int)sizeof(buf) - 1 ? req->content_len : (int)sizeof(buf) - 1;
@@ -1854,6 +1932,7 @@ static esp_err_t webhook_handler(httpd_req_t *req) {
 
 /* Delete all recorded clips (except the one being written right now). */
 static esp_err_t rec_clear_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     int deleted = 0;
     DIR *d = opendir(REC_DIR);
     if (d) {
@@ -1874,6 +1953,7 @@ static esp_err_t rec_clear_handler(httpd_req_t *req) {
 }
 
 static esp_err_t mask_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char q[128], v[64];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK &&
         httpd_query_key_value(q, "grid", v, sizeof(v)) == ESP_OK) {
@@ -1890,6 +1970,7 @@ static esp_err_t mask_handler(httpd_req_t *req) {
 }
 
 static esp_err_t time_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
@@ -1904,6 +1985,7 @@ static esp_err_t time_handler(httpd_req_t *req) {
 }
 
 static esp_err_t ntp_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char q[160], v[96];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
         if (httpd_query_key_value(q, "tz", v, sizeof(v)) == ESP_OK) {
@@ -2258,6 +2340,7 @@ static void stream_worker(void *arg) {
 }
 
 static esp_err_t stream_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     if (!camera_ready) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "text/plain");
@@ -2286,6 +2369,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 }
 
 static esp_err_t control_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     if (!camera_ready) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_sendstr(req, "Camera is not initialized");
@@ -2374,6 +2458,7 @@ static esp_err_t control_handler(httpd_req_t *req) {
 }
 
 static esp_err_t reboot_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_sendstr(req, "Rebooting");
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -2382,6 +2467,7 @@ static esp_err_t reboot_handler(httpd_req_t *req) {
 }
 
 static esp_err_t format_sd_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     /* Stop the recorder and wait for it to close its file before we unmount,
        otherwise it writes into a torn-down filesystem and crashes. */
     bool was_rec = rec_enabled;
@@ -2407,6 +2493,7 @@ static esp_err_t format_sd_handler(httpd_req_t *req) {
 }
 
 static esp_err_t index_handler(httpd_req_t *req) {
+    if (!auth_ok(req)) return ESP_OK;
     char sd_status_html[sizeof(sd_status_text) * 6 + 1];
     html_escape_string(sd_status_html, sizeof(sd_status_html), sd_status_text);
 
@@ -2588,6 +2675,13 @@ static esp_err_t index_handler(httpd_req_t *req) {
 
     /* ---- System ---- */
     httpd_resp_sendstr_chunk(req, "<section class='card'><h3>System</h3><div class='kv' id='sysinfo'></div></section>");
+    httpd_resp_sendstr_chunk(req,
+        "<section class='card'><h3>Security</h3>"
+        "<div class='meta' style='margin:0 0 10px'><span id='authState'>checking...</span></div>"
+        "<input id='authPass' type='password' placeholder='set a password (blank = open)' autocomplete='new-password' style='width:100%;box-sizing:border-box;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg)'>"
+        "<div class='toolbar' style='margin-top:8px'><button class='btn primary' id='authSave' type='button'>Apply</button></div>"
+        "<div style='color:var(--muted);font-size:12px;margin-top:4px'>When set, every page and endpoint requires this password (HTTP Basic auth). The live stream may prompt for it separately.</div>"
+        "</section>");
 
     /* ---- Firmware / OTA (advanced, last) ---- */
     const esp_app_desc_t *app = esp_app_get_description();
@@ -2699,6 +2793,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "const rows=[['Chip',d.chip+' rev'+d.rev+', '+d.cores+' cores @ '+d.cpu_mhz+' MHz'],['Flash',d.flash_mb+' MB, ESP-IDF '+d.idf],['RAM free',fmtB(d.heap_free)+' / '+fmtB(d.heap_total)],['PSRAM free',fmtB(d.psram_free)+' / '+fmtB(d.psram_total)],['SD free',d.sd_total?fmtB(d.sd_free)+' / '+fmtB(d.sd_total):'no card'],['Uptime',uh+'h '+um+'m']];"
         "document.getElementById('sysinfo').innerHTML=rows.map(r=>'<div><span>'+r[0]+'</span><b>'+r[1]+'</b></div>').join('');}catch(e){}}"
         "setInterval(sysRefresh,5000);sysRefresh();"
+        "fetch('/auth').then(r=>r.json()).then(d=>document.getElementById('authState').textContent=d.locked?'🔒 Locked — password required.':'🔓 Open — anyone on the network can control the camera.').catch(()=>{});"
+        "document.getElementById('authSave').onclick=async()=>{const p=document.getElementById('authPass').value;if(p&&!confirm('Set password? You will need it every time you open the camera.'))return;if(!p&&!confirm('Remove password and make the camera open to everyone on the network?'))return;await fetch('/auth',{method:'POST',body:p});document.getElementById('authPass').value='';alert(p?'Password set. Reload and log in.':'Password removed.');location.reload();};"
         "async function timeRefresh(){try{const d=await(await fetch('/time')).json();document.getElementById('clock').textContent=d.time;document.getElementById('ntpState').textContent=d.ntp?(d.synced?'NTP synced':'NTP syncing...'):'NTP off (clips numbered)';document.getElementById('ntpOn').checked=d.ntp;var t=document.getElementById('tz');if(document.activeElement!==t)t.value=d.tz;}catch(e){}}"
         "document.getElementById('ntpOn').onchange=async e=>{await fetch('/ntp?on='+(e.target.checked?1:0),{method:'POST'});setTimeout(timeRefresh,600);};"
         "document.getElementById('tz').onchange=async e=>{await fetch('/ntp?tz='+encodeURIComponent(e.target.value),{method:'POST'});setTimeout(timeRefresh,600);};"
@@ -2776,6 +2872,8 @@ static httpd_uri_t uri_rec_clear  = { .uri = "/rec/clear", .method = HTTP_POST, 
 static httpd_uri_t uri_event_jpg  = { .uri = "/event.jpg", .method = HTTP_GET,  .handler = event_jpg_handler, .user_ctx = NULL };
 static httpd_uri_t uri_update_get = { .uri = "/update",    .method = HTTP_GET,  .handler = update_handler,   .user_ctx = NULL };
 static httpd_uri_t uri_update_post= { .uri = "/update",    .method = HTTP_POST, .handler = update_handler,   .user_ctx = NULL };
+static httpd_uri_t uri_auth_get   = { .uri = "/auth",      .method = HTTP_GET,  .handler = auth_handler,     .user_ctx = NULL };
+static httpd_uri_t uri_auth_post  = { .uri = "/auth",      .method = HTTP_POST, .handler = auth_handler,     .user_ctx = NULL };
 static httpd_uri_t uri_hook_get   = { .uri = "/webhook",   .method = HTTP_GET,  .handler = webhook_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_hook_post  = { .uri = "/webhook",   .method = HTTP_POST, .handler = webhook_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_mask_get   = { .uri = "/mask",      .method = HTTP_GET,  .handler = mask_handler,     .user_ctx = NULL };
@@ -2791,7 +2889,7 @@ static httpd_handle_t start_webserver(void) {
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 34;
+    config.max_uri_handlers = 40;
     config.max_resp_headers = 8;
     /* index_handler builds sizable HTML on-stack; 4 KB default is too tight. */
     config.stack_size = 8192;
@@ -2828,6 +2926,8 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_event_jpg);
         httpd_register_uri_handler(server, &uri_update_get);
         httpd_register_uri_handler(server, &uri_update_post);
+        httpd_register_uri_handler(server, &uri_auth_get);
+        httpd_register_uri_handler(server, &uri_auth_post);
         httpd_register_uri_handler(server, &uri_hook_get);
         httpd_register_uri_handler(server, &uri_hook_post);
         httpd_register_uri_handler(server, &uri_mask_get);
