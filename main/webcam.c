@@ -1080,27 +1080,31 @@ static bool make_event_gif(const char *path) {
     if (!rgb) return false;
     ge_GIF *gif = ge_new_gif(path, w, h, pal, 7, 0);
     if (!gif) { free(rgb); return false; }
-    for (int f = 0; f < GIF_FRAMES; f++) {
+    /* Add a frame only on a good decode (under active recording the camera is
+       contended and some grabs return torn/undecodable JPEGs). Retry to fill it. */
+    int added = 0;
+    for (int attempt = 0; added < GIF_FRAMES && attempt < GIF_FRAMES * 4; attempt++) {
         camera_fb_t *cf = esp_camera_fb_get();
+        bool good = false;
         if (cf) {
-            /* Skip if resolution changed mid-capture — else the decode overflows the
-               buffer sized for the first frame. */
-            if (cf->width / 2 == w && cf->height / 2 == h && jpg2rgb565(cf->buf, cf->len, rgb, JPG_SCALE_2X)) {
+            if (cf->width / 2 == w && cf->height / 2 == h &&
+                jpg2rgb565(cf->buf, cf->len, rgb, JPG_SCALE_2X)) {
                 uint16_t *px = (uint16_t *)rgb;
                 for (int i = 0; i < w * h; i++) {
                     uint16_t p = px[i];
                     int r = ((p >> 11) & 0x1f) >> 3, g = ((p >> 5) & 0x3f) >> 3, b = (p & 0x1f) >> 3;
                     gif->frame[i] = (uint8_t)((r << 5) | (g << 2) | b);
                 }
+                good = true;
             }
             esp_camera_fb_return(cf);
         }
-        ge_add_frame(gif, 10);   /* 100 ms/frame playback */
+        if (good) { ge_add_frame(gif, 10); added++; }  /* 100 ms/frame playback */
         vTaskDelay(pdMS_TO_TICKS(GIF_FRAME_MS));
     }
     ge_close_gif(gif);
     free(rgb);
-    return true;
+    return added > 0;
 }
 static void telegram_send_gif(const char *caption, const char *path) {
     FILE *f = fopen(path, "rb");
