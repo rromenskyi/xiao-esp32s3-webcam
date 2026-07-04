@@ -8,13 +8,11 @@
 
 static const char *TAG = "person";
 static PedestrianDetect *g_detect = nullptr;
-static uint8_t *g_rgb = nullptr;          // PSRAM decode buffer (1/2-scale rgb565)
-static uint8_t *g_rgb888 = nullptr;       // PSRAM RGB888 buffer (full frame)
-static const size_t RGB_CAP = 400 * 300 * 2;   // enough for up to UXGA/2 ... capped below
-static const size_t RGB888_CAP = 640 * 480 * 3;
+static uint8_t *g_rgb = nullptr;          // PSRAM decode buffer (downscaled rgb565)
+static const size_t RGB_CAP = 400 * 300 * 2;   // holds any framesize once downscaled
 static float g_last_score = 0.0f;
 static float g_min_score = 0.25f;         // app-side trigger threshold (person present)
-static int g_pixfmt = 2;                  // 0=RGB565LE, 1=RGB565BE, 2=RGB888
+static int g_pixfmt = 0;                  // rgb565 byte order: 0=LE, 1=BE
 
 extern "C" int person_last_score_pct(void) { return (int)(g_last_score * 100.0f); }
 extern "C" void person_set_pixfmt(int f) { g_pixfmt = f; }
@@ -38,27 +36,20 @@ extern "C" int person_detect_init(void) {
 // Returns 1 if a person is detected in the JPEG frame, else 0.
 extern "C" int person_in_frame(camera_fb_t *fb) {
     if (!g_detect || !fb) return 0;
+    /* Pick a downscale so any framesize (VGA..UXGA) fits the buffer; the detector
+       resizes to its own input size internally, so a smaller frame is fine. */
+    int sf = fb->width <= 800 ? 2 : (fb->width <= 1600 ? 4 : 8);
+    jpg_scale_t scale = sf == 2 ? JPG_SCALE_2X : (sf == 4 ? JPG_SCALE_4X : JPG_SCALE_8X);
+    int w = fb->width / sf, h = fb->height / sf;
+    if ((size_t)(w * h * 2) > RGB_CAP) return 0;
+    if (!g_rgb) g_rgb = (uint8_t *)heap_caps_malloc(RGB_CAP, MALLOC_CAP_SPIRAM);
+    if (!g_rgb || !jpg2rgb565(fb->buf, fb->len, g_rgb, scale)) return 0;
     dl::image::img_t img = {};
-    if (g_pixfmt == 2) {                                  /* full-res RGB888 */
-        if ((size_t)(fb->width * fb->height * 3) > RGB888_CAP) return 0;
-        if (!g_rgb888) g_rgb888 = (uint8_t *)heap_caps_malloc(RGB888_CAP, MALLOC_CAP_SPIRAM);
-        if (!g_rgb888) return 0;
-        if (!fmt2rgb888(fb->buf, fb->len, fb->format, g_rgb888)) return 0;
-        img.data = g_rgb888;
-        img.width = fb->width;
-        img.height = fb->height;
-        img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888;
-    } else {                                              /* 1/2-scale RGB565 */
-        int w = fb->width / 2, h = fb->height / 2;
-        if ((size_t)(w * h * 2) > RGB_CAP) return 0;
-        if (!g_rgb) g_rgb = (uint8_t *)heap_caps_malloc(RGB_CAP, MALLOC_CAP_SPIRAM);
-        if (!g_rgb || !jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_2X)) return 0;
-        img.data = g_rgb;
-        img.width = w;
-        img.height = h;
-        img.pix_type = (g_pixfmt == 1) ? dl::image::DL_IMAGE_PIX_TYPE_RGB565BE
-                                       : dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
-    }
+    img.data = g_rgb;
+    img.width = w;
+    img.height = h;
+    img.pix_type = (g_pixfmt == 1) ? dl::image::DL_IMAGE_PIX_TYPE_RGB565BE
+                                   : dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
     auto &results = g_detect->run(img);
     float best = 0.0f;
     for (const auto &r : results) if (r.score > best) best = r.score;

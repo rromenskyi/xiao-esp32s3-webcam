@@ -1743,10 +1743,11 @@ static esp_err_t detect_handler(httpd_req_t *req) {
     int64_t t0 = esp_timer_get_time();
     int person = person_in_frame(fb);
     int ms = (int)((esp_timer_get_time() - t0) / 1000);
+    int fw = fb->width, fh = fb->height;   /* capture before returning the buffer */
     esp_camera_fb_return(fb);
     char body[160];
     snprintf(body, sizeof(body), "{\"ready\":true,\"person\":%s,\"score\":%d,\"ms\":%d,\"w\":%d,\"h\":%d}",
-             person ? "true" : "false", person_last_score_pct(), ms, fb->width, fb->height);
+             person ? "true" : "false", person_last_score_pct(), ms, fw, fh);
     return httpd_resp_sendstr(req, body);
 }
 
@@ -1774,6 +1775,16 @@ static esp_err_t event_jpg_handler(httpd_req_t *req) {
     return r;
 }
 
+/* Strip characters that would break our JSON payloads or the newline-delimited SD
+   config file: control chars (incl. CR/LF), double-quote and backslash. */
+static void sanitize_field(char *s) {
+    char *d = s;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c >= 0x20 && c != '"' && c != '\\') *d++ = *s;
+    }
+    *d = '\0';
+}
 static int hexv(char c) { if (c >= '0' && c <= '9') return c - '0'; if (c >= 'a' && c <= 'f') return c - 'a' + 10; if (c >= 'A' && c <= 'F') return c - 'A' + 10; return -1; }
 static void urldecode(char *s) {
     char *d = s; int a, b;
@@ -1792,14 +1803,14 @@ static esp_err_t webhook_handler(httpd_req_t *req) {
         char buf[200];
         int len = req->content_len < (int)sizeof(buf) - 1 ? req->content_len : (int)sizeof(buf) - 1;
         int r = len > 0 ? httpd_req_recv(req, buf, len) : 0;
-        if (r >= 0) { buf[r] = 0; strlcpy(webhook_url, buf, sizeof(webhook_url)); sys_cfg_save(); }
+        if (r >= 0) { buf[r] = 0; strlcpy(webhook_url, buf, sizeof(webhook_url)); sanitize_field(webhook_url); sys_cfg_save(); }
     }
     char q[256], v[96];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
         bool ch = false;
-        if (httpd_query_key_value(q, "name", v, sizeof(v)) == ESP_OK && v[0]) { urldecode(v); strlcpy(cam_name, v, sizeof(cam_name)); ch = true; }
-        if (httpd_query_key_value(q, "tgtok", v, sizeof(v)) == ESP_OK) { urldecode(v); if (v[0]) { strlcpy(tg_token, v, sizeof(tg_token)); ch = true; } }
-        if (httpd_query_key_value(q, "tgchat", v, sizeof(v)) == ESP_OK) { urldecode(v); strlcpy(tg_chat, v, sizeof(tg_chat)); ch = true; }
+        if (httpd_query_key_value(q, "name", v, sizeof(v)) == ESP_OK && v[0]) { urldecode(v); sanitize_field(v); strlcpy(cam_name, v, sizeof(cam_name)); ch = true; }
+        if (httpd_query_key_value(q, "tgtok", v, sizeof(v)) == ESP_OK) { urldecode(v); sanitize_field(v); if (v[0]) { strlcpy(tg_token, v, sizeof(tg_token)); ch = true; } }
+        if (httpd_query_key_value(q, "tgchat", v, sizeof(v)) == ESP_OK) { urldecode(v); sanitize_field(v); strlcpy(tg_chat, v, sizeof(tg_chat)); ch = true; }
         if (ch) sys_cfg_save();
         if (httpd_query_key_value(q, "test", v, sizeof(v)) == ESP_OK) { webhook_last = 0; webhook_notify("test"); }
     }
@@ -2340,6 +2351,12 @@ static esp_err_t reboot_handler(httpd_req_t *req) {
 }
 
 static esp_err_t format_sd_handler(httpd_req_t *req) {
+    /* Stop the recorder and wait for it to close its file before we unmount,
+       otherwise it writes into a torn-down filesystem and crashes. */
+    bool was_rec = rec_enabled;
+    rec_enabled = false;
+    for (int i = 0; i < 30 && rec_cur_file[0]; i++) vTaskDelay(pdMS_TO_TICKS(50));
+
     if (sd_ready && sd_card) {
         esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, sd_card);
         sd_ready = false;
@@ -2348,6 +2365,7 @@ static esp_err_t format_sd_handler(httpd_req_t *req) {
     }
 
     esp_err_t err = mount_sd_card(true);
+    rec_enabled = was_rec;   /* resume recording on the fresh card if it was on */
     if (err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, sd_status_text);
         return ESP_FAIL;
