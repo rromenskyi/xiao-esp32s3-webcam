@@ -39,11 +39,14 @@ extern "C" int person_in_frame(camera_fb_t *fb) {
     /* Pick a downscale so any framesize (VGA..UXGA) fits the buffer; the detector
        resizes to its own input size internally, so a smaller frame is fine. */
     int sf = fb->width <= 800 ? 2 : (fb->width <= 1600 ? 4 : 8);
-    jpg_scale_t scale = sf == 2 ? JPG_SCALE_2X : (sf == 4 ? JPG_SCALE_4X : JPG_SCALE_8X);
     int w = fb->width / sf, h = fb->height / sf;
     if ((size_t)(w * h * 2) > RGB_CAP) return 0;
     if (!g_rgb) g_rgb = (uint8_t *)heap_caps_malloc(RGB_CAP, MALLOC_CAP_SPIRAM);
-    if (!g_rgb || !jpg2rgb565(fb->buf, fb->len, g_rgb, scale)) return 0;
+    if (!g_rgb) return 0;
+    bool ok = sf == 2 ? jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_2X)
+            : sf == 4 ? jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_4X)
+                      : jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_8X);
+    if (!ok) return 0;
     dl::image::img_t img = {};
     img.data = g_rgb;
     img.width = w;
