@@ -212,7 +212,7 @@ static SemaphoreHandle_t event_lock = NULL;
 
 /* Ring of the most recent recorded JPEG frames — the GIF is built from these
    (already-captured, complete frames) instead of fighting the camera live. */
-#define GIF_RING 10
+#define GIF_RING 16
 static uint8_t *gif_ring_buf[GIF_RING];
 static size_t   gif_ring_len[GIF_RING], gif_ring_cap[GIF_RING];
 static int      gif_ring_w[GIF_RING], gif_ring_h[GIF_RING];
@@ -276,7 +276,8 @@ static camera_config_t camera_config = {
     .pin_vsync = CAM_PIN_VSYNC,
     .pin_href  = CAM_PIN_HREF,
     .pin_pclk  = CAM_PIN_PCLK,
-    .xclk_freq_hz = 20000000,
+    .xclk_freq_hz = 16000000,   /* 16 MHz (down from 20): gives the JPEG DMA headroom
+                                   so heavy PSRAM load doesn't corrupt frames */
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
     .pixel_format = PIXFORMAT_JPEG,
@@ -1103,9 +1104,27 @@ static void telegram_send_photo(const char *caption, const uint8_t *jpg, size_t 
     telegram_send_media("sendPhoto", "photo", caption, jpg, jlen, "event.jpg", "image/jpeg");
 }
 
-/* Capture a short burst and encode a small animated GIF to `path`. */
-#define GIF_FRAMES   10
-#define GIF_FRAME_MS 100
+/* A DMA-torn frame is a valid JPEG but its top and bottom are different captures,
+   so one row jumps abruptly across the whole width — detect that seam and skip it. */
+static bool frame_has_seam(const uint16_t *px, int w, int h) {
+    int prev = 0, maxj = 0; long sum = 0; int cnt = 0;
+    for (int y = 0; y < h; y++) {
+        long s = 0; int n = 0;
+        for (int x = 0; x < w; x += 4) {
+            uint16_t p = px[y * w + x];
+            int r = ((p >> 11) & 0x1f) << 3, g = ((p >> 5) & 0x3f) << 2, b = (p & 0x1f) << 3;
+            s += (r * 77 + g * 150 + b * 29) >> 8; n++;
+        }
+        int m = n ? (int)(s / n) : 0;
+        if (y > 0) { int j = m > prev ? m - prev : prev - m; if (j > maxj) maxj = j; sum += j; cnt++; }
+        prev = m;
+    }
+    int avg = cnt ? (int)(sum / cnt) : 0;
+    return maxj > 55 && maxj > avg * 10;
+}
+
+/* Encode a small animated GIF to `path` from the recent-frame ring. */
+#define GIF_MAX_FRAMES 12
 static bool make_event_gif(const char *path) {
     if (!sd_ready || !gif_ring_lock) return false;
     static uint8_t pal[3 * 128]; static bool pal_init = false;
@@ -1124,11 +1143,12 @@ static bool make_event_gif(const char *path) {
     if (gif) {
         /* Build from the buffered recorded frames (oldest -> newest): already
            captured, complete JPEGs — fast and no live camera contention. */
-        for (int k = 0; k < GIF_RING; k++) {
+        for (int k = 0; k < GIF_RING && added < GIF_MAX_FRAMES; k++) {
             int i = (gif_ring_head + k) % GIF_RING;
             if (gif_ring_len[i] == 0 || gif_ring_w[i] != fw || gif_ring_h[i] != fh) continue;
             if (!jpg2rgb565(gif_ring_buf[i], gif_ring_len[i], rgb, JPG_SCALE_2X)) continue;
             uint16_t *px = (uint16_t *)rgb;
+            if (frame_has_seam(px, w, h)) continue;   /* drop a DMA-torn frame */
             for (int j = 0; j < w * h; j++) {
                 uint16_t p = px[j];
                 int r = ((p >> 11) & 0x1f) >> 3, g = ((p >> 5) & 0x3f) >> 3, b = (p & 0x1f) >> 3;
