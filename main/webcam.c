@@ -220,6 +220,9 @@ static int      gif_ring_head = 0;
 static SemaphoreHandle_t gif_ring_lock = NULL;
 static void gif_ring_push(camera_fb_t *fb) {
     if (!gif_ring_lock || !fb || fb->format != PIXFORMAT_JPEG) return;
+    /* Only buffer COMPLETE JPEGs (end with EOI) — skip truncated frames the sensor
+       emits under load, so the GIF is never built from a torn frame. */
+    if (fb->len < 2 || fb->buf[fb->len - 2] != 0xFF || fb->buf[fb->len - 1] != 0xD9) return;
     if (xSemaphoreTake(gif_ring_lock, 0) != pdTRUE) return;   /* non-blocking */
     int i = gif_ring_head;
     if (gif_ring_cap[i] < fb->len) {
@@ -1192,9 +1195,12 @@ static void webhook_task(void *arg) {
             camera_fb_t *fb = esp_camera_fb_get();
             if (fb) { if (fb->format == PIXFORMAT_JPEG) { buf = heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM); if (buf) { memcpy(buf, fb->buf, fb->len); blen = fb->len; } } esp_camera_fb_return(fb); }
         }
+        /* Build the GIF FIRST, from the trigger-moment ring — the photo upload takes
+           seconds over TLS, and the ring is live, so doing it after would capture
+           frames from after the subject already left. */
+        bool have_gif = make_event_gif("/sdcard/event.gif");
         if (buf) { telegram_send_photo(caption, buf, blen); free(buf); }
-        if (make_event_gif("/sdcard/event.gif"))     /* then an animated preview */
-            telegram_send_gif(caption, "/sdcard/event.gif");
+        if (have_gif) telegram_send_gif(caption, "/sdcard/event.gif");
     }
     free(event);
     vTaskDelete(NULL);
