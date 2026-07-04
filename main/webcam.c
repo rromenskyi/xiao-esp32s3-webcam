@@ -17,6 +17,7 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "esp_http_client.h"
+#include "esp_https_ota.h"
 #include "esp_crt_bundle.h"
 #include "gifenc.h"
 #include "person_detect.h"
@@ -81,6 +82,7 @@ static esp_err_t detect_handler(httpd_req_t *req);
 static esp_err_t rec_clear_handler(httpd_req_t *req);
 static esp_err_t webhook_handler(httpd_req_t *req);
 static esp_err_t event_jpg_handler(httpd_req_t *req);
+static esp_err_t update_handler(httpd_req_t *req);
 static esp_err_t rec_toggle_handler(httpd_req_t *req);
 static esp_err_t rec_list_handler(httpd_req_t *req);
 static esp_err_t files_list_handler(httpd_req_t *req);
@@ -1189,6 +1191,47 @@ static void event_notify_stop(const char *clipname) {
     if (c && xTaskCreate(event_stop_task, "evstop", 5120, c, 5, NULL) != pdPASS) free(c);
 }
 
+/* -------- Pull-OTA: self-update from the GitHub 'nightly' release -------- */
+#define FW_NIGHTLY_URL "https://github.com/rromenskyi/xiao-esp32s3-webcam/releases/download/nightly/xiao_s3_webcam.bin"
+static char ota_pull_status[80] = "idle";
+static volatile bool ota_pull_busy = false;
+
+static void ota_pull_task(void *arg) {
+    ota_pull_busy = true;
+    snprintf(ota_pull_status, sizeof(ota_pull_status), "checking GitHub...");
+    esp_http_client_config_t http = { .url = FW_NIGHTLY_URL, .crt_bundle_attach = esp_crt_bundle_attach,
+                                      .timeout_ms = 20000, .keep_alive_enable = true };
+    esp_https_ota_config_t cfg = { .http_config = &http };
+    esp_https_ota_handle_t h = NULL;
+    esp_err_t err = esp_https_ota_begin(&cfg, &h);
+    if (err != ESP_OK) {
+        snprintf(ota_pull_status, sizeof(ota_pull_status), "connect failed: %s", esp_err_to_name(err));
+        ota_pull_busy = false; vTaskDelete(NULL); return;
+    }
+    esp_app_desc_t nd = {0};
+    if (esp_https_ota_get_img_desc(h, &nd) == ESP_OK &&
+        strncmp(nd.version, esp_app_get_description()->version, sizeof(nd.version)) == 0) {
+        esp_https_ota_abort(h);
+        snprintf(ota_pull_status, sizeof(ota_pull_status), "up to date (%s)", nd.version);
+        ota_pull_busy = false; vTaskDelete(NULL); return;
+    }
+    snprintf(ota_pull_status, sizeof(ota_pull_status), "downloading %s...", nd.version);
+    do { err = esp_https_ota_perform(h); } while (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
+    if (err == ESP_OK && esp_https_ota_is_complete_data_received(h) && esp_https_ota_finish(h) == ESP_OK) {
+        snprintf(ota_pull_status, sizeof(ota_pull_status), "updated to %s - rebooting", nd.version);
+        vTaskDelay(pdMS_TO_TICKS(1200));
+        esp_restart();
+    }
+    esp_https_ota_abort(h);
+    snprintf(ota_pull_status, sizeof(ota_pull_status), "update failed: %s", esp_err_to_name(err));
+    ota_pull_busy = false;
+    vTaskDelete(NULL);
+}
+static void ota_pull_start(void) {
+    if (ota_pull_busy) return;
+    xTaskCreate(ota_pull_task, "ota_pull", 8192, NULL, 5, NULL);
+}
+
 /* Write a subtitle sidecar (clip.srt) with one wall-clock caption per second, so
    a player (VLC) shows the real time while playing. Zero cost to the video. */
 static void write_clip_srt(const char *avi_name, time_t start, int frames, int fps) {
@@ -1681,6 +1724,16 @@ static esp_err_t detect_handler(httpd_req_t *req) {
     char body[160];
     snprintf(body, sizeof(body), "{\"ready\":true,\"person\":%s,\"score\":%d,\"ms\":%d,\"w\":%d,\"h\":%d}",
              person ? "true" : "false", person_last_score_pct(), ms, fb->width, fb->height);
+    return httpd_resp_sendstr(req, body);
+}
+
+/* Pull-OTA: POST starts a self-update from GitHub; GET returns status + version. */
+static esp_err_t update_handler(httpd_req_t *req) {
+    if (req->method == HTTP_POST) ota_pull_start();
+    char body[160];
+    snprintf(body, sizeof(body), "{\"version\":\"%s\",\"status\":\"%s\",\"busy\":%s}",
+             esp_app_get_description()->version, ota_pull_status, ota_pull_busy ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, body);
 }
 
@@ -2482,6 +2535,8 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "</div>"
         "<div style='height:8px;border-radius:999px;background:var(--line);overflow:hidden'><div id='otabar' style='height:100%;width:0;background:var(--accent);transition:width .2s'></div></div>"
         "<div class='meta'><span id='otaState'>Select a .bin and flash. The board reboots into it automatically.</span></div>"
+        "<div class='toolbar' style='margin-top:12px'><button class='btn primary' id='pullBtn' type='button'>Auto-update from GitHub</button><span class='val' id='pullState' style='align-self:center'></span></div>"
+        "<div style='color:var(--muted);font-size:12px;margin-top:4px'>Pulls the latest CI build (nightly release) over HTTPS and reflashes only if newer.</div>"
         "</section>");
 
     httpd_resp_sendstr_chunk(req, "</main><script>");
@@ -2505,6 +2560,9 @@ static esp_err_t index_handler(httpd_req_t *req) {
         "const _r=document.getElementById('reboot');if(_r)_r.onclick=()=>{if(confirm('Reboot board?'))fetch('/reboot');};"
         "const _rec=document.getElementById('rec');if(_rec)_rec.onclick=async()=>{const st=document.getElementById('micState'),pl=document.getElementById('player');_rec.disabled=true;const t0=st.textContent;st.textContent='Recording 5s...';try{const r=await fetch('/audio.wav?secs=5');const b=await r.blob();pl.src=URL.createObjectURL(b);pl.play().catch(()=>{});st.textContent='Captured '+(b.size>>10)+' KB';}catch(e){st.textContent='Record failed';}_rec.disabled=false;setTimeout(()=>{st.textContent=t0;},4000);};"
         "const _fl=document.getElementById('flash');if(_fl)_fl.onclick=()=>{const f=document.getElementById('fw').files[0],st=document.getElementById('otaState'),bar=document.getElementById('otabar');if(!f){st.textContent='Pick a .bin first';return;}if(!confirm('Flash '+f.name+' ('+(f.size>>10)+' KB) over WiFi?'))return;_fl.disabled=true;const x=new XMLHttpRequest();x.open('POST','/ota');x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);bar.style.width=p+'%';st.textContent='Uploading '+p+'%';}};x.onload=()=>{st.textContent=x.status===200?'Flashed. Rebooting... reload in ~10s.':'OTA failed: '+x.responseText;if(x.status===200){bar.style.width='100%';setTimeout(()=>location.reload(),12000);}else _fl.disabled=false;};x.onerror=()=>{st.textContent='Upload error';_fl.disabled=false;};x.send(f);};"
+        "var _pb=document.getElementById('pullBtn'),_ps=document.getElementById('pullState');"
+        "async function pullPoll(){try{const d=await(await fetch('/update')).json();_ps.textContent='v'+d.version+' · '+d.status;if(d.busy){setTimeout(pullPoll,2000);}else{_pb.disabled=false;if(/rebooting/.test(d.status))setTimeout(()=>location.reload(),12000);}}catch(e){}}"
+        "if(_pb){pullPoll();_pb.onclick=async()=>{if(!confirm('Check GitHub and update if a newer build is available?'))return;_pb.disabled=true;_ps.textContent='starting...';await fetch('/update',{method:'POST'});setTimeout(pullPoll,1500);};}"
         /* Recording controls */
         "const recBtn=document.getElementById('recBtn'),recPct=document.getElementById('recPct');"
         "async function recRefresh(){try{const d=await (await fetch('/rec/list')).json();"
@@ -2644,6 +2702,8 @@ static httpd_uri_t uri_sysinfo    = { .uri = "/sysinfo",   .method = HTTP_GET,  
 static httpd_uri_t uri_detect     = { .uri = "/detect",    .method = HTTP_GET,  .handler = detect_handler,   .user_ctx = NULL };
 static httpd_uri_t uri_rec_clear  = { .uri = "/rec/clear", .method = HTTP_POST, .handler = rec_clear_handler, .user_ctx = NULL };
 static httpd_uri_t uri_event_jpg  = { .uri = "/event.jpg", .method = HTTP_GET,  .handler = event_jpg_handler, .user_ctx = NULL };
+static httpd_uri_t uri_update_get = { .uri = "/update",    .method = HTTP_GET,  .handler = update_handler,   .user_ctx = NULL };
+static httpd_uri_t uri_update_post= { .uri = "/update",    .method = HTTP_POST, .handler = update_handler,   .user_ctx = NULL };
 static httpd_uri_t uri_hook_get   = { .uri = "/webhook",   .method = HTTP_GET,  .handler = webhook_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_hook_post  = { .uri = "/webhook",   .method = HTTP_POST, .handler = webhook_handler,  .user_ctx = NULL };
 static httpd_uri_t uri_mask_get   = { .uri = "/mask",      .method = HTTP_GET,  .handler = mask_handler,     .user_ctx = NULL };
@@ -2694,6 +2754,8 @@ static httpd_handle_t start_webserver(void) {
         httpd_register_uri_handler(server, &uri_detect);
         httpd_register_uri_handler(server, &uri_rec_clear);
         httpd_register_uri_handler(server, &uri_event_jpg);
+        httpd_register_uri_handler(server, &uri_update_get);
+        httpd_register_uri_handler(server, &uri_update_post);
         httpd_register_uri_handler(server, &uri_hook_get);
         httpd_register_uri_handler(server, &uri_hook_post);
         httpd_register_uri_handler(server, &uri_mask_get);
