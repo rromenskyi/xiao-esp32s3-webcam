@@ -3,6 +3,8 @@
 #include "img_converters.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "pedestrian_detect.hpp"
 #include "dl_image_define.hpp"
 
@@ -13,6 +15,7 @@ static const size_t RGB_CAP = 400 * 300 * 2;   // holds any framesize once downs
 static float g_last_score = 0.0f;
 static float g_min_score = 0.25f;         // app-side trigger threshold (person present)
 static int g_pixfmt = 0;                  // rgb565 byte order: 0=LE, 1=BE
+static SemaphoreHandle_t g_lock = nullptr; // serialize person_in_frame (rec_task vs /detect)
 
 extern "C" int person_last_score_pct(void) { return (int)(g_last_score * 100.0f); }
 extern "C" void person_set_pixfmt(int f) { g_pixfmt = f; }
@@ -20,6 +23,7 @@ extern "C" void person_set_thr_pct(int pct) { g_min_score = pct / 100.0f; }
 extern "C" int person_thr_pct(void) { return (int)(g_min_score * 100.0f); }
 
 extern "C" int person_detect_init(void) {
+    if (!g_lock) g_lock = xSemaphoreCreateMutex();
     if (g_detect) return 0;
     if (!g_rgb) g_rgb = (uint8_t *)heap_caps_malloc(RGB_CAP, MALLOC_CAP_SPIRAM);
     if (!g_rgb) { ESP_LOGE(TAG, "rgb buffer alloc failed"); return -1; }
@@ -36,26 +40,31 @@ extern "C" int person_detect_init(void) {
 // Returns 1 if a person is detected in the JPEG frame, else 0.
 extern "C" int person_in_frame(camera_fb_t *fb) {
     if (!g_detect || !fb) return 0;
+    if (g_lock) xSemaphoreTake(g_lock, portMAX_DELAY);   /* rec_task and /detect can race */
+    int result = 0;
     /* Pick a downscale so any framesize (VGA..UXGA) fits the buffer; the detector
        resizes to its own input size internally, so a smaller frame is fine. */
     int sf = fb->width <= 800 ? 2 : (fb->width <= 1600 ? 4 : 8);
     int w = fb->width / sf, h = fb->height / sf;
-    if ((size_t)(w * h * 2) > RGB_CAP) return 0;
-    if (!g_rgb) g_rgb = (uint8_t *)heap_caps_malloc(RGB_CAP, MALLOC_CAP_SPIRAM);
-    if (!g_rgb) return 0;
-    bool ok = sf == 2 ? jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_2X)
-            : sf == 4 ? jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_4X)
-                      : jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_8X);
-    if (!ok) return 0;
-    dl::image::img_t img = {};
-    img.data = g_rgb;
-    img.width = w;
-    img.height = h;
-    img.pix_type = (g_pixfmt == 1) ? dl::image::DL_IMAGE_PIX_TYPE_RGB565BE
-                                   : dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
-    auto &results = g_detect->run(img);
-    float best = 0.0f;
-    for (const auto &r : results) if (r.score > best) best = r.score;
-    g_last_score = best;
-    return best >= g_min_score ? 1 : 0;
+    if ((size_t)(w * h * 2) <= RGB_CAP) {
+        if (!g_rgb) g_rgb = (uint8_t *)heap_caps_malloc(RGB_CAP, MALLOC_CAP_SPIRAM);
+        bool ok = g_rgb && (sf == 2 ? jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_2X)
+                          : sf == 4 ? jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_4X)
+                                    : jpg2rgb565(fb->buf, fb->len, g_rgb, JPG_SCALE_8X));
+        if (ok) {
+            dl::image::img_t img = {};
+            img.data = g_rgb;
+            img.width = w;
+            img.height = h;
+            img.pix_type = (g_pixfmt == 1) ? dl::image::DL_IMAGE_PIX_TYPE_RGB565BE
+                                           : dl::image::DL_IMAGE_PIX_TYPE_RGB565LE;
+            auto &results = g_detect->run(img);
+            float best = 0.0f;
+            for (const auto &r : results) if (r.score > best) best = r.score;
+            g_last_score = best;
+            result = best >= g_min_score ? 1 : 0;
+        }
+    }
+    if (g_lock) xSemaphoreGive(g_lock);
+    return result;
 }

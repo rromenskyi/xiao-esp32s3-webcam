@@ -935,33 +935,40 @@ static void rec_next_path(char *out, size_t n) {
 /* Delete oldest clips until total recorded size fits under the budget (% of card). */
 static void rec_enforce_budget(void) {
     if (!sd_ready || !sd_card) return;
-    static char names[256][32];
-    static uint64_t sizes[256];
-    static time_t mtimes[256];
     uint64_t cap = (uint64_t)sd_card->csd.capacity * sd_card->csd.sector_size;
     uint64_t budget = cap / 100 * rec_budget_pct;
-    int n = 0; uint64_t total = 0;
+
+    /* Sum ALL clips (no arbitrary cap — thousands of clips is normal). */
+    uint64_t total = 0;
     DIR *d = opendir(REC_DIR);
     if (!d) return;
     struct dirent *e;
-    while ((e = readdir(d)) && n < 256) {
+    while ((e = readdir(d))) {
         if (strncmp(e->d_name, "clip", 4) != 0 || !strstr(e->d_name, ".avi")) continue;
         char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", e->d_name);
-        struct stat st; if (stat(full, &st) != 0) continue;
-        strlcpy(names[n], e->d_name, sizeof(names[n])); sizes[n] = st.st_size; mtimes[n] = st.st_mtime;
-        total += st.st_size; n++;
+        struct stat st; if (stat(full, &st) == 0) total += st.st_size;
     }
     closedir(d);
-    while (total > budget && n > 0) {
-        /* Oldest by modification time — robust across numbered and timestamped names. */
-        int oldest = 0;
-        for (int i = 1; i < n; i++) if (mtimes[i] < mtimes[oldest]) oldest = i;
-        char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", names[oldest]);
-        unlink(full);
-        ESP_LOGI(TAG, "rec budget: deleted %s", names[oldest]);
-        total -= sizes[oldest];
-        n--;
-        if (oldest != n) { strlcpy(names[oldest], names[n], sizeof(names[oldest])); sizes[oldest] = sizes[n]; mtimes[oldest] = mtimes[n]; }
+
+    /* Delete the oldest clip (never the one being written) until under budget. */
+    int guard = 0;
+    while (total > budget && guard++ < 100000) {
+        char oldest[48] = ""; time_t oldest_mt = 0; uint64_t oldest_sz = 0;
+        if (!(d = opendir(REC_DIR))) break;
+        while ((e = readdir(d))) {
+            if (strncmp(e->d_name, "clip", 4) != 0 || !strstr(e->d_name, ".avi")) continue;
+            if (rec_cur_file[0] && strcmp(e->d_name, rec_cur_file) == 0) continue;
+            char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", e->d_name);
+            struct stat st; if (stat(full, &st) != 0) continue;
+            if (!oldest[0] || st.st_mtime < oldest_mt) { strlcpy(oldest, e->d_name, sizeof(oldest)); oldest_mt = st.st_mtime; oldest_sz = st.st_size; }
+        }
+        closedir(d);
+        if (!oldest[0]) break;   /* nothing deletable left */
+        char full[300]; snprintf(full, sizeof(full), REC_DIR "/%s", oldest);
+        if (unlink(full) != 0) break;
+        char *dot = strrchr(full, '.'); if (dot) { strcpy(dot, ".srt"); unlink(full); }  /* drop the sidecar too */
+        ESP_LOGI(TAG, "rec budget: deleted %s", oldest);
+        total = total > oldest_sz ? total - oldest_sz : 0;
     }
 }
 
@@ -1076,7 +1083,9 @@ static bool make_event_gif(const char *path) {
     for (int f = 0; f < GIF_FRAMES; f++) {
         camera_fb_t *cf = esp_camera_fb_get();
         if (cf) {
-            if (jpg2rgb565(cf->buf, cf->len, rgb, JPG_SCALE_2X)) {
+            /* Skip if resolution changed mid-capture — else the decode overflows the
+               buffer sized for the first frame. */
+            if (cf->width / 2 == w && cf->height / 2 == h && jpg2rgb565(cf->buf, cf->len, rgb, JPG_SCALE_2X)) {
                 uint16_t *px = (uint16_t *)rgb;
                 for (int i = 0; i < w * h; i++) {
                     uint16_t p = px[i];
@@ -1442,7 +1451,19 @@ static esp_err_t rec_list_handler(httpd_req_t *req) {
 
 /* --- Generic SD file browser (confined to /sdcard) --- */
 static bool sd_path_ok(const char *p) {
-    return p && strncmp(p, "/sdcard", 7) == 0 && !strstr(p, "..");
+    if (!p || strncmp(p, "/sdcard", 7) != 0 || strstr(p, "..")) return false;
+    /* Reject chars that would break out into HTML/JSON when the name is later
+       rendered in the web UI (XSS) — none are valid in our filenames anyway. */
+    for (const char *c = p; *c; c++)
+        if ((unsigned char)*c < 0x20 || strchr("<>\"'&\\`", *c)) return false;
+    return true;
+}
+/* The clip currently being written must not be deleted/renamed out from under rec_task. */
+static bool is_active_clip(const char *path) {
+    if (!rec_cur_file[0]) return false;
+    char active[80];
+    snprintf(active, sizeof(active), REC_DIR "/%s", rec_cur_file);
+    return strcmp(path, active) == 0;
 }
 
 static esp_err_t files_list_handler(httpd_req_t *req) {
@@ -1576,6 +1597,7 @@ static esp_err_t delete_handler(httpd_req_t *req) {
     }
     url_decode(path, v, sizeof(path));
     if (!sd_path_ok(path)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_FAIL; }
+    if (is_active_clip(path)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "clip is recording"); return ESP_FAIL; }
     if (unlink(path) != 0) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "delete failed"); return ESP_FAIL; }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -1596,6 +1618,7 @@ static esp_err_t rename_handler(httpd_req_t *req) {
     if (!sd_two_paths(req, src, sizeof(src), dst, sizeof(dst))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad src/dst"); return ESP_FAIL;
     }
+    if (is_active_clip(src)) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "clip is recording"); return ESP_FAIL; }
     if (rename(src, dst) != 0) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "rename failed"); return ESP_FAIL; }
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, "{\"ok\":true}");
@@ -1763,8 +1786,12 @@ static esp_err_t update_handler(httpd_req_t *req) {
 
 /* Serve the snapshot of the last detection event (for the alarm photo). */
 static esp_err_t event_jpg_handler(httpd_req_t *req) {
-    if (!event_lock || xSemaphoreTake(event_lock, pdMS_TO_TICKS(500)) != pdTRUE || event_jpg_len == 0) {
-        if (event_lock) xSemaphoreGive(event_lock);
+    if (!event_lock || xSemaphoreTake(event_lock, pdMS_TO_TICKS(500)) != pdTRUE) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no event snapshot yet");
+        return ESP_OK;
+    }
+    if (event_jpg_len == 0) {   /* mutex is held here — release it before returning */
+        xSemaphoreGive(event_lock);
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no event snapshot yet");
         return ESP_OK;
     }
@@ -3010,7 +3037,7 @@ static esp_err_t prov_save_handler(httpd_req_t *req) {
     }
     buf[received] = '\0';
 
-    char ssid[32] = {0}, pass[64] = {0};
+    char ssid[33] = {0}, pass[64] = {0};   /* 32-char SSID + NUL */
     form_get_value(buf, "ssid", ssid, sizeof(ssid));
     form_get_value(buf, "pass", pass, sizeof(pass));
 
