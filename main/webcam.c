@@ -210,6 +210,30 @@ static uint8_t *event_jpg = NULL;          /* snapshot of the moment a detection
 static size_t event_jpg_len = 0, event_jpg_cap = 0;
 static SemaphoreHandle_t event_lock = NULL;
 
+/* Ring of the most recent recorded JPEG frames — the GIF is built from these
+   (already-captured, complete frames) instead of fighting the camera live. */
+#define GIF_RING 10
+static uint8_t *gif_ring_buf[GIF_RING];
+static size_t   gif_ring_len[GIF_RING], gif_ring_cap[GIF_RING];
+static int      gif_ring_w[GIF_RING], gif_ring_h[GIF_RING];
+static int      gif_ring_head = 0;
+static SemaphoreHandle_t gif_ring_lock = NULL;
+static void gif_ring_push(camera_fb_t *fb) {
+    if (!gif_ring_lock || !fb || fb->format != PIXFORMAT_JPEG) return;
+    if (xSemaphoreTake(gif_ring_lock, 0) != pdTRUE) return;   /* non-blocking */
+    int i = gif_ring_head;
+    if (gif_ring_cap[i] < fb->len) {
+        uint8_t *p = heap_caps_realloc(gif_ring_buf[i], fb->len, MALLOC_CAP_SPIRAM);
+        if (p) { gif_ring_buf[i] = p; gif_ring_cap[i] = fb->len; }
+    }
+    if (gif_ring_cap[i] >= fb->len) {
+        memcpy(gif_ring_buf[i], fb->buf, fb->len);
+        gif_ring_len[i] = fb->len; gif_ring_w[i] = fb->width; gif_ring_h[i] = fb->height;
+        gif_ring_head = (i + 1) % GIF_RING;
+    }
+    xSemaphoreGive(gif_ring_lock);
+}
+
 /* Motion-gated recording (heuristic: background subtraction on a 1/8 frame). */
 static bool motion_enabled = false;        /* record only while there is motion */
 static int  motion_sens = 5;               /* % of pixels changed to count as motion (1..30) */
@@ -1075,48 +1099,40 @@ static void telegram_send_photo(const char *caption, const uint8_t *jpg, size_t 
 #define GIF_FRAMES   10
 #define GIF_FRAME_MS 100
 static bool make_event_gif(const char *path) {
-    if (!sd_ready || !camera_ready) return false;
+    if (!sd_ready || !gif_ring_lock) return false;
     static uint8_t pal[3 * 128]; static bool pal_init = false;
-    if (!pal_init) {   /* 128-color 2-3-2 palette (extra green levels; trie ~2 MB) */
+    if (!pal_init) {   /* 128-color 2-3-2 palette (extra green levels) */
         for (int i = 0; i < 128; i++) { pal[i*3] = ((i>>5)&3)*85; pal[i*3+1] = ((i>>2)&7)*36; pal[i*3+2] = (i&3)*85; }
         pal_init = true;
     }
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) return false;
-    int w = fb->width / 2, h = fb->height / 2;
-    esp_camera_fb_return(fb);
-    if (w <= 0 || h <= 0 || (w * h) > 400 * 300) return false;   /* up to SVGA/2 */
-    uint8_t *rgb = heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM);
-    if (!rgb) return false;
-    ge_GIF *gif = ge_new_gif(path, w, h, pal, 7, 0);
-    if (!gif) { free(rgb); return false; }
-    /* Add a frame only on a good decode (under active recording the camera is
-       contended and some grabs return torn/undecodable JPEGs). Retry to fill it. */
+    if (xSemaphoreTake(gif_ring_lock, pdMS_TO_TICKS(1500)) != pdTRUE) return false;
+    int newest = (gif_ring_head + GIF_RING - 1) % GIF_RING;
+    int fw = gif_ring_w[newest], fh = gif_ring_h[newest];
+    int w = fw / 2, h = fh / 2;
+    bool ok = fw > 0 && fh > 0 && w > 0 && h > 0 && (w * h) <= 400 * 300;
+    uint8_t *rgb = ok ? heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM) : NULL;
+    ge_GIF *gif = rgb ? ge_new_gif(path, w, h, pal, 7, 0) : NULL;
     int added = 0;
-    for (int attempt = 0; added < GIF_FRAMES && attempt < GIF_FRAMES * 4; attempt++) {
-        camera_fb_t *cf = esp_camera_fb_get();
-        bool good = false;
-        if (cf) {
-            /* Only use a COMPLETE JPEG (ends with the EOI marker) — under load the
-               sensor sometimes emits a truncated frame that decodes to a torn image. */
-            bool whole = cf->len >= 2 && cf->buf[cf->len - 2] == 0xFF && cf->buf[cf->len - 1] == 0xD9;
-            if (cf->width / 2 == w && cf->height / 2 == h && whole &&
-                jpg2rgb565(cf->buf, cf->len, rgb, JPG_SCALE_2X)) {
-                uint16_t *px = (uint16_t *)rgb;
-                for (int i = 0; i < w * h; i++) {
-                    uint16_t p = px[i];
-                    int r = ((p >> 11) & 0x1f) >> 3, g = ((p >> 5) & 0x3f) >> 3, b = (p & 0x1f) >> 3;
-                    gif->frame[i] = (uint8_t)((r << 5) | (g << 2) | b);
-                }
-                good = true;
+    if (gif) {
+        /* Build from the buffered recorded frames (oldest -> newest): already
+           captured, complete JPEGs — fast and no live camera contention. */
+        for (int k = 0; k < GIF_RING; k++) {
+            int i = (gif_ring_head + k) % GIF_RING;
+            if (gif_ring_len[i] == 0 || gif_ring_w[i] != fw || gif_ring_h[i] != fh) continue;
+            if (!jpg2rgb565(gif_ring_buf[i], gif_ring_len[i], rgb, JPG_SCALE_2X)) continue;
+            uint16_t *px = (uint16_t *)rgb;
+            for (int j = 0; j < w * h; j++) {
+                uint16_t p = px[j];
+                int r = ((p >> 11) & 0x1f) >> 3, g = ((p >> 5) & 0x3f) >> 3, b = (p & 0x1f) >> 3;
+                gif->frame[j] = (uint8_t)((r << 5) | (g << 2) | b);
             }
-            esp_camera_fb_return(cf);
+            ge_add_frame(gif, 12);   /* ~120 ms/frame ~ real-time */
+            added++;
         }
-        if (good) { ge_add_frame(gif, 10); added++; }  /* 100 ms/frame playback */
-        vTaskDelay(pdMS_TO_TICKS(GIF_FRAME_MS));
+        ge_close_gif(gif);
     }
-    ge_close_gif(gif);
-    free(rgb);
+    if (rgb) free(rgb);
+    xSemaphoreGive(gif_ring_lock);
     return added > 0;
 }
 static void telegram_send_gif(const char *caption, const char *path) {
@@ -1334,6 +1350,7 @@ static void rec_task(void *arg) {
         int64_t fstart = esp_timer_get_time();
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        gif_ring_push(fb);   /* keep recent frames for a fast, clean event GIF */
 
         /* Motion gate: when enabled, only record while there is motion (+ tail). */
         if (motion_enabled) {
@@ -2521,6 +2538,7 @@ static esp_err_t index_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr_chunk(req,
         "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><title>XIAO Camera</title>"
+        "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%230b1016'/><rect x='9' y='19' width='46' height='31' rx='6' fill='%2316c0d8'/><rect x='23' y='13' width='16' height='8' rx='3' fill='%2316c0d8'/><circle cx='32' cy='35' r='11' fill='%230b1016'/><circle cx='32' cy='35' r='6.5' fill='%2316c0d8'/><circle cx='47' cy='27' r='2.6' fill='%230b1016'/></svg>\">"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<style>"
         ":root{color-scheme:dark;--bg:#0a0d10;--panel:#141b22;--panel2:#1a232c;--line:#243039;--text:#e8eef2;--muted:#8b99a6;--accent:#19c3ae;--accent-d:#12a08e;--danger:#e5484d;--r:12px;}"
@@ -2994,6 +3012,7 @@ static esp_err_t prov_index_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr_chunk(req,
         "<!DOCTYPE html><html><head><meta charset='utf-8'><title>XIAO Setup</title>"
+        "<link rel=\"icon\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%230b1016'/><rect x='9' y='19' width='46' height='31' rx='6' fill='%2316c0d8'/><rect x='23' y='13' width='16' height='8' rx='3' fill='%2316c0d8'/><circle cx='32' cy='35' r='11' fill='%230b1016'/><circle cx='32' cy='35' r='6.5' fill='%2316c0d8'/><circle cx='47' cy='27' r='2.6' fill='%230b1016'/></svg>\">"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<style>"
         ":root{color-scheme:light;--bg:#eef2f5;--card:#fff;--text:#0f1b24;--muted:#5f7280;--line:#dbe3e8;--accent:#0ea394;--accent-d:#0b8578;}"
@@ -3539,6 +3558,7 @@ void app_main(void) {
     start_stream_webserver();
     /* Loop recorder runs continuously; it idles until enabled via the web UI. */
     event_lock = xSemaphoreCreateMutex();
+    gif_ring_lock = xSemaphoreCreateMutex();
     xTaskCreate(rec_task, "rec_task", 6144, NULL, 4, NULL);
 #if CONFIG_BT_NIMBLE_ENABLED
     ble_init();
