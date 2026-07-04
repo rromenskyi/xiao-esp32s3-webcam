@@ -3335,6 +3335,11 @@ static void ble_init(void) {
 }
 #endif /* CONFIG_BT_NIMBLE_ENABLED */
 
+static void ota_mark_valid_cb(void *arg) {
+    esp_err_t e = esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGI(TAG, "OTA image confirmed healthy (%s)", esp_err_to_name(e));
+}
+
 void app_main(void) {
     ESP_LOGI(TAG, "Starting XIAO ESP32S3 Sense Webcam");
     esp_err_t ret = nvs_flash_init();
@@ -3383,4 +3388,9 @@ void app_main(void) {
 #if CONFIG_BT_NIMBLE_ENABLED
     ble_init();
 #endif
+    /* Anti-brick: if we survive 30 s without a crash/bootloop, mark this OTA image
+       valid so the bootloader stops holding a rollback (a bad update reverts instead). */
+    const esp_timer_create_args_t valid_timer = { .callback = ota_mark_valid_cb, .name = "ota_valid" };
+    esp_timer_handle_t th;
+    if (esp_timer_create(&valid_timer, &th) == ESP_OK) esp_timer_start_once(th, 30LL * 1000 * 1000);
 }
