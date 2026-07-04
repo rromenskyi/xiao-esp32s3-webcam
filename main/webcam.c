@@ -1215,12 +1215,12 @@ static void webhook_task(void *arg) {
             camera_fb_t *fb = esp_camera_fb_get();
             if (fb) { if (fb->format == PIXFORMAT_JPEG) { buf = heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM); if (buf) { memcpy(buf, fb->buf, fb->len); blen = fb->len; } } esp_camera_fb_return(fb); }
         }
-        /* Build the GIF FIRST, from the trigger-moment ring — the photo upload takes
-           seconds over TLS, and the ring is live, so doing it after would capture
-           frames from after the subject already left. */
-        bool have_gif = make_event_gif("/sdcard/event.gif");
+        /* Send the photo FIRST — it's captured at the trigger moment, so it's timely,
+           and building the GIF can be slow under SD load; never let it delay the alert.
+           (GIF timeliness is handled by the frame ring, built right after.) */
         if (buf) { telegram_send_photo(caption, buf, blen); free(buf); }
-        if (have_gif) telegram_send_gif(caption, "/sdcard/event.gif");
+        if (make_event_gif("/sdcard/event.gif"))
+            telegram_send_gif(caption, "/sdcard/event.gif");
     }
     free(event);
     vTaskDelete(NULL);
