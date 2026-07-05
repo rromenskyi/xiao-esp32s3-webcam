@@ -218,6 +218,27 @@ static size_t   gif_ring_len[GIF_RING], gif_ring_cap[GIF_RING];
 static int      gif_ring_w[GIF_RING], gif_ring_h[GIF_RING];
 static int      gif_ring_head = 0;
 static SemaphoreHandle_t gif_ring_lock = NULL;
+
+/* Snapshot of the ring at the moment the event triggered — ensures the GIF
+   shows frames from that moment, not stale frames grabbed after TLS photo upload. */
+static uint8_t *gif_snap_buf[GIF_RING];
+static size_t   gif_snap_len[GIF_RING], gif_snap_cap[GIF_RING];
+static int      gif_snap_w[GIF_RING], gif_snap_h[GIF_RING];
+static int      gif_snap_head = 0;
+static void gif_ring_snapshot(void) {
+    if (!gif_ring_lock || xSemaphoreTake(gif_ring_lock, 0) != pdTRUE) return;
+    for (int i = 0; i < GIF_RING; i++) {
+        if (gif_snap_cap[i] < gif_ring_cap[i]) {
+            uint8_t *p = heap_caps_realloc(gif_snap_buf[i], gif_ring_cap[i], MALLOC_CAP_SPIRAM);
+            if (p) gif_snap_buf[i] = p; else { xSemaphoreGive(gif_ring_lock); return; }
+            gif_snap_cap[i] = gif_ring_cap[i];
+        }
+        if (gif_ring_len[i]) memcpy(gif_snap_buf[i], gif_ring_buf[i], gif_ring_len[i]);
+        gif_snap_len[i] = gif_ring_len[i]; gif_snap_w[i] = gif_ring_w[i]; gif_snap_h[i] = gif_ring_h[i];
+    }
+    gif_snap_head = gif_ring_head;
+    xSemaphoreGive(gif_ring_lock);
+}
 static void gif_ring_push(camera_fb_t *fb) {
     if (!gif_ring_lock || !fb || fb->format != PIXFORMAT_JPEG) return;
     /* Only buffer COMPLETE JPEGs (end with EOI) — skip truncated frames the sensor
@@ -1123,30 +1144,30 @@ static bool frame_has_seam(const uint16_t *px, int w, int h) {
     return maxj > 55 && maxj > avg * 10;
 }
 
-/* Encode a small animated GIF to `path` from the recent-frame ring. */
+/* Encode a small animated GIF to `path` from the frozen snapshot of the ring.
+   The snapshot was taken at the moment the event triggered, so the GIF shows
+   frames from that moment regardless of when the photo finishes uploading. */
 #define GIF_MAX_FRAMES 12
 static bool make_event_gif(const char *path) {
-    if (!sd_ready || !gif_ring_lock) return false;
+    if (!sd_ready) return false;
     static uint8_t pal[3 * 128]; static bool pal_init = false;
     if (!pal_init) {   /* 128-color 2-3-2 palette (extra green levels) */
         for (int i = 0; i < 128; i++) { pal[i*3] = ((i>>5)&3)*85; pal[i*3+1] = ((i>>2)&7)*36; pal[i*3+2] = (i&3)*85; }
         pal_init = true;
     }
-    if (xSemaphoreTake(gif_ring_lock, pdMS_TO_TICKS(1500)) != pdTRUE) return false;
-    int newest = (gif_ring_head + GIF_RING - 1) % GIF_RING;
-    int fw = gif_ring_w[newest], fh = gif_ring_h[newest];
+    int newest = (gif_snap_head + GIF_RING - 1) % GIF_RING;
+    int fw = gif_snap_w[newest], fh = gif_snap_h[newest];
     int w = fw / 2, h = fh / 2;
     bool ok = fw > 0 && fh > 0 && w > 0 && h > 0 && (w * h) <= 400 * 300;
     uint8_t *rgb = ok ? heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM) : NULL;
     ge_GIF *gif = rgb ? ge_new_gif(path, w, h, pal, 7, 0) : NULL;
     int added = 0;
     if (gif) {
-        /* Build from the buffered recorded frames (oldest -> newest): already
-           captured, complete JPEGs — fast and no live camera contention. */
+        /* Build from the snapshot (frozen at trigger moment, no locking needed). */
         for (int k = 0; k < GIF_RING && added < GIF_MAX_FRAMES; k++) {
-            int i = (gif_ring_head + k) % GIF_RING;
-            if (gif_ring_len[i] == 0 || gif_ring_w[i] != fw || gif_ring_h[i] != fh) continue;
-            if (!jpg2rgb565(gif_ring_buf[i], gif_ring_len[i], rgb, JPG_SCALE_2X)) continue;
+            int i = (gif_snap_head + k) % GIF_RING;
+            if (gif_snap_len[i] == 0 || gif_snap_w[i] != fw || gif_snap_h[i] != fh) continue;
+            if (!jpg2rgb565(gif_snap_buf[i], gif_snap_len[i], rgb, JPG_SCALE_2X)) continue;
             uint16_t *px = (uint16_t *)rgb;
             if (frame_has_seam(px, w, h)) continue;   /* drop a DMA-torn frame */
             for (int j = 0; j < w * h; j++) {
@@ -1160,7 +1181,6 @@ static bool make_event_gif(const char *path) {
         ge_close_gif(gif);
     }
     if (rgb) free(rgb);
-    xSemaphoreGive(gif_ring_lock);
     return added > 0;
 }
 static void telegram_send_gif(const char *caption, const char *path) {
@@ -1392,7 +1412,7 @@ static void rec_task(void *arg) {
                     /* Heuristic fired. If ML is on, only record when it's a person. */
                     bool trigger = (motion_ml && ml_ready) ? (person_in_frame(fb) != 0) : true;
                     if (trigger) {
-                        if (mcool == 0) { save_event_snapshot(fb); webhook_notify(event_hooks ? "start" : (motion_ml && ml_ready ? "person" : "motion")); }  /* new event */
+                        if (mcool == 0) { save_event_snapshot(fb); gif_ring_snapshot(); webhook_notify(event_hooks ? "start" : (motion_ml && ml_ready ? "person" : "motion")); }  /* new event */
                         mcool = REC_TARGET_FPS * 5;
                     }
                 }
