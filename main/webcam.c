@@ -219,25 +219,40 @@ static int      gif_ring_w[GIF_RING], gif_ring_h[GIF_RING];
 static int      gif_ring_head = 0;
 static SemaphoreHandle_t gif_ring_lock = NULL;
 
-/* Snapshot of the ring at the moment the event triggered — ensures the GIF
-   shows frames from that moment, not stale frames grabbed after TLS photo upload. */
-static uint8_t *gif_snap_buf[GIF_RING];
-static size_t   gif_snap_len[GIF_RING], gif_snap_cap[GIF_RING];
-static int      gif_snap_w[GIF_RING], gif_snap_h[GIF_RING];
-static int      gif_snap_head = 0;
-static void gif_ring_snapshot(void) {
-    if (!gif_ring_lock || xSemaphoreTake(gif_ring_lock, 0) != pdTRUE) return;
+/* Each notification owns its ring snapshot. This keeps a slow Telegram upload
+   from racing with a later event that captures a new snapshot. */
+typedef struct {
+    char *event;
+    uint8_t *buf[GIF_RING];
+    size_t len[GIF_RING];
+    int w[GIF_RING], h[GIF_RING];
+    int head;
+} webhook_job_t;
+
+static void webhook_job_free(webhook_job_t *job) {
+    if (!job) return;
+    for (int i = 0; i < GIF_RING; i++) free(job->buf[i]);
+    free(job->event);
+    free(job);
+}
+
+static bool gif_ring_snapshot(webhook_job_t *job) {
+    if (!job || !gif_ring_lock || xSemaphoreTake(gif_ring_lock, 0) != pdTRUE) return false;
+    bool ok = true;
     for (int i = 0; i < GIF_RING; i++) {
-        if (gif_snap_cap[i] < gif_ring_cap[i]) {
-            uint8_t *p = heap_caps_realloc(gif_snap_buf[i], gif_ring_cap[i], MALLOC_CAP_SPIRAM);
-            if (p) gif_snap_buf[i] = p; else { xSemaphoreGive(gif_ring_lock); return; }
-            gif_snap_cap[i] = gif_ring_cap[i];
+        if (gif_ring_len[i]) {
+            job->buf[i] = heap_caps_malloc(gif_ring_len[i], MALLOC_CAP_SPIRAM);
+            if (!job->buf[i]) { ok = false; break; }
+            memcpy(job->buf[i], gif_ring_buf[i], gif_ring_len[i]);
         }
-        if (gif_ring_len[i]) memcpy(gif_snap_buf[i], gif_ring_buf[i], gif_ring_len[i]);
-        gif_snap_len[i] = gif_ring_len[i]; gif_snap_w[i] = gif_ring_w[i]; gif_snap_h[i] = gif_ring_h[i];
+        job->len[i] = gif_ring_len[i]; job->w[i] = gif_ring_w[i]; job->h[i] = gif_ring_h[i];
     }
-    gif_snap_head = gif_ring_head;
+    job->head = gif_ring_head;
     xSemaphoreGive(gif_ring_lock);
+    if (!ok) {
+        for (int i = 0; i < GIF_RING; i++) { free(job->buf[i]); job->buf[i] = NULL; job->len[i] = 0; }
+    }
+    return ok;
 }
 static void gif_ring_push(camera_fb_t *fb) {
     if (!gif_ring_lock || !fb || fb->format != PIXFORMAT_JPEG) return;
@@ -1148,15 +1163,15 @@ static bool frame_has_seam(const uint16_t *px, int w, int h) {
    The snapshot was taken at the moment the event triggered, so the GIF shows
    frames from that moment regardless of when the photo finishes uploading. */
 #define GIF_MAX_FRAMES 12
-static bool make_event_gif(const char *path) {
-    if (!sd_ready) return false;
+static bool make_event_gif(const char *path, const webhook_job_t *job) {
+    if (!sd_ready || !job) return false;
     static uint8_t pal[3 * 128]; static bool pal_init = false;
     if (!pal_init) {   /* 128-color 2-3-2 palette (extra green levels) */
         for (int i = 0; i < 128; i++) { pal[i*3] = ((i>>5)&3)*85; pal[i*3+1] = ((i>>2)&7)*36; pal[i*3+2] = (i&3)*85; }
         pal_init = true;
     }
-    int newest = (gif_snap_head + GIF_RING - 1) % GIF_RING;
-    int fw = gif_snap_w[newest], fh = gif_snap_h[newest];
+    int newest = (job->head + GIF_RING - 1) % GIF_RING;
+    int fw = job->w[newest], fh = job->h[newest];
     int w = fw / 2, h = fh / 2;
     bool ok = fw > 0 && fh > 0 && w > 0 && h > 0 && (w * h) <= 400 * 300;
     uint8_t *rgb = ok ? heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM) : NULL;
@@ -1165,9 +1180,9 @@ static bool make_event_gif(const char *path) {
     if (gif) {
         /* Build from the snapshot (frozen at trigger moment, no locking needed). */
         for (int k = 0; k < GIF_RING && added < GIF_MAX_FRAMES; k++) {
-            int i = (gif_snap_head + k) % GIF_RING;
-            if (gif_snap_len[i] == 0 || gif_snap_w[i] != fw || gif_snap_h[i] != fh) continue;
-            if (!jpg2rgb565(gif_snap_buf[i], gif_snap_len[i], rgb, JPG_SCALE_2X)) continue;
+            int i = (job->head + k) % GIF_RING;
+            if (job->len[i] == 0 || job->w[i] != fw || job->h[i] != fh) continue;
+            if (!jpg2rgb565(job->buf[i], job->len[i], rgb, JPG_SCALE_2X)) continue;
             uint16_t *px = (uint16_t *)rgb;
             if (frame_has_seam(px, w, h)) continue;   /* drop a DMA-torn frame */
             for (int j = 0; j < w * h; j++) {
@@ -1200,7 +1215,8 @@ static void telegram_send_gif(const char *caption, const char *path) {
 
 /* Fire the alarm webhook (runs in its own task so it never blocks recording). */
 static void webhook_task(void *arg) {
-    char *event = (char *)arg;
+    webhook_job_t *job = (webhook_job_t *)arg;
+    const char *event = job->event;
     char ts[24] = "";
     if (time_synced) { time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm); }
     char photo[80] = "";
@@ -1239,10 +1255,12 @@ static void webhook_task(void *arg) {
            and building the GIF can be slow under SD load; never let it delay the alert.
            (GIF timeliness is handled by the frame ring, built right after.) */
         if (buf) { telegram_send_photo(caption, buf, blen); free(buf); }
-        if (make_event_gif("/sdcard/event.gif"))
-            telegram_send_gif(caption, "/sdcard/event.gif");
+        char gif_path[64];
+        snprintf(gif_path, sizeof(gif_path), "/sdcard/event-%p.gif", (void *)job);
+        if (make_event_gif(gif_path, job)) telegram_send_gif(caption, gif_path);
+        unlink(gif_path);
     }
-    free(event);
+    webhook_job_free(job);
     vTaskDelete(NULL);
 }
 
@@ -1252,8 +1270,14 @@ static void webhook_notify(const char *event) {
     int64_t now = esp_timer_get_time();
     if (webhook_last && now - webhook_last < 10LL * 1000 * 1000) return;
     webhook_last = now;
-    char *ev = strdup(event);
-    if (ev && xTaskCreate(webhook_task, "webhook", 8192, ev, 5, NULL) != pdPASS) free(ev);
+    webhook_job_t *job = calloc(1, sizeof(*job));
+    if (!job) return;
+    job->event = strdup(event);
+    if (!job->event) { webhook_job_free(job); return; }
+    /* GIF data is only needed for Telegram. Capture it now, before this task can
+       spend seconds uploading the event photo. A failed snapshot simply omits GIF. */
+    if (tg_token[0] && tg_chat[0] && sd_ready) gif_ring_snapshot(job);
+    if (xTaskCreate(webhook_task, "webhook", 8192, job, 5, NULL) != pdPASS) webhook_job_free(job);
 }
 
 /* POST a lightweight "stop" webhook with a download URL for the finalized clip
@@ -1412,7 +1436,7 @@ static void rec_task(void *arg) {
                     /* Heuristic fired. If ML is on, only record when it's a person. */
                     bool trigger = (motion_ml && ml_ready) ? (person_in_frame(fb) != 0) : true;
                     if (trigger) {
-                        if (mcool == 0) { save_event_snapshot(fb); gif_ring_snapshot(); webhook_notify(event_hooks ? "start" : (motion_ml && ml_ready ? "person" : "motion")); }  /* new event */
+                        if (mcool == 0) { save_event_snapshot(fb); webhook_notify(event_hooks ? "start" : (motion_ml && ml_ready ? "person" : "motion")); }  /* new event */
                         mcool = REC_TARGET_FPS * 5;
                     }
                 }
