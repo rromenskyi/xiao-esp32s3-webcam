@@ -227,6 +227,7 @@ typedef struct {
     size_t len[GIF_RING];
     int w[GIF_RING], h[GIF_RING];
     int head;
+    volatile bool snap_ready;   /* set once the ring snapshot has been captured */
 } webhook_job_t;
 
 static void webhook_job_free(webhook_job_t *job) {
@@ -236,8 +237,7 @@ static void webhook_job_free(webhook_job_t *job) {
     free(job);
 }
 
-static bool gif_ring_snapshot(webhook_job_t *job) {
-    if (!job || !gif_ring_lock || xSemaphoreTake(gif_ring_lock, 0) != pdTRUE) return false;
+static bool gif_ring_snapshot_locked(webhook_job_t *job) {
     bool ok = true;
     for (int i = 0; i < GIF_RING; i++) {
         if (gif_ring_len[i]) {
@@ -248,11 +248,34 @@ static bool gif_ring_snapshot(webhook_job_t *job) {
         job->len[i] = gif_ring_len[i]; job->w[i] = gif_ring_w[i]; job->h[i] = gif_ring_h[i];
     }
     job->head = gif_ring_head;
-    xSemaphoreGive(gif_ring_lock);
     if (!ok) {
         for (int i = 0; i < GIF_RING; i++) { free(job->buf[i]); job->buf[i] = NULL; job->len[i] = 0; }
     }
     return ok;
+}
+static bool gif_ring_snapshot(webhook_job_t *job) {
+    if (!job || !gif_ring_lock || xSemaphoreTake(gif_ring_lock, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    bool ok = gif_ring_snapshot_locked(job);
+    xSemaphoreGive(gif_ring_lock);
+    return ok;
+}
+
+/* Delayed snapshot: the ring only spans ~1.6 s, so a snapshot taken AT the trigger
+   holds mostly pre-event frames (empty scene). Instead rec_task counts down a few
+   more frames after the trigger and snapshots then, so the ring covers the event
+   itself. The photo still goes out immediately (it's frozen separately). */
+static webhook_job_t *gif_snap_pending = NULL;   /* guarded by gif_ring_lock */
+static int gif_snap_countdown = 0;
+static void gif_ring_tick(void) {
+    if (!gif_snap_pending) return;                            /* racy read is benign */
+    if (xSemaphoreTake(gif_ring_lock, 0) != pdTRUE) return;   /* retry on next frame */
+    webhook_job_t *job = gif_snap_pending;
+    if (job && --gif_snap_countdown <= 0) {
+        gif_ring_snapshot_locked(job);
+        gif_snap_pending = NULL;
+        job->snap_ready = true;    /* after this the job may be freed — don't touch it */
+    }
+    xSemaphoreGive(gif_ring_lock);
 }
 static void gif_ring_push(camera_fb_t *fb) {
     if (!gif_ring_lock || !fb || fb->format != PIXFORMAT_JPEG) return;
@@ -1165,9 +1188,13 @@ static bool frame_has_seam(const uint16_t *px, int w, int h) {
 #define GIF_MAX_FRAMES 12
 static bool make_event_gif(const char *path, const webhook_job_t *job) {
     if (!sd_ready || !job) return false;
-    static uint8_t pal[3 * 128]; static bool pal_init = false;
-    if (!pal_init) {   /* 128-color 2-3-2 palette (extra green levels) */
-        for (int i = 0; i < 128; i++) { pal[i*3] = ((i>>5)&3)*85; pal[i*3+1] = ((i>>2)&7)*36; pal[i*3+2] = (i&3)*85; }
+    static uint8_t pal[3 * 256]; static bool pal_init = false;
+    if (!pal_init) {   /* 256-color 3-3-2 palette (PSRAM affords the bigger dictionary) */
+        for (int i = 0; i < 256; i++) {
+            pal[i*3]   = (uint8_t)((((i >> 5) & 7) * 255) / 7);
+            pal[i*3+1] = (uint8_t)((((i >> 2) & 7) * 255) / 7);
+            pal[i*3+2] = (uint8_t)(((i & 3) * 255) / 3);
+        }
         pal_init = true;
     }
     int newest = (job->head + GIF_RING - 1) % GIF_RING;
@@ -1175,20 +1202,39 @@ static bool make_event_gif(const char *path, const webhook_job_t *job) {
     int w = fw / 2, h = fh / 2;
     bool ok = fw > 0 && fh > 0 && w > 0 && h > 0 && (w * h) <= 400 * 300;
     uint8_t *rgb = ok ? heap_caps_malloc((size_t)w * h * 2, MALLOC_CAP_SPIRAM) : NULL;
-    ge_GIF *gif = rgb ? ge_new_gif(path, w, h, pal, 7, 0) : NULL;
+    ge_GIF *gif = rgb ? ge_new_gif(path, w, h, pal, 8, 0) : NULL;
     int added = 0;
     if (gif) {
-        /* Build from the snapshot (frozen at trigger moment, no locking needed). */
-        for (int k = 0; k < GIF_RING && added < GIF_MAX_FRAMES; k++) {
+        /* If more frames survive than the cap, drop the OLDEST — the newest frames
+           are the event itself; keeping the head of the ring cut the subject out. */
+        int valid = 0;
+        for (int k = 0; k < GIF_RING; k++) {
+            int i = (job->head + k) % GIF_RING;
+            if (job->len[i] && job->w[i] == fw && job->h[i] == fh) valid++;
+        }
+        int skip = valid > GIF_MAX_FRAMES ? valid - GIF_MAX_FRAMES : 0;
+        /* Ordered (Bayer 4x4) dithering hides the palette banding for ~free. */
+        static const uint8_t bay[4][4] = {{0,8,2,10},{12,4,14,6},{3,11,1,9},{15,7,13,5}};
+        for (int k = 0; k < GIF_RING; k++) {
             int i = (job->head + k) % GIF_RING;
             if (job->len[i] == 0 || job->w[i] != fw || job->h[i] != fh) continue;
+            if (skip) { skip--; continue; }
             if (!jpg2rgb565(job->buf[i], job->len[i], rgb, JPG_SCALE_2X)) continue;
             uint16_t *px = (uint16_t *)rgb;
             if (frame_has_seam(px, w, h)) continue;   /* drop a DMA-torn frame */
-            for (int j = 0; j < w * h; j++) {
-                uint16_t p = px[j];
-                int r = ((p >> 11) & 0x1f) >> 3, g = ((p >> 5) & 0x3f) >> 3, b = (p & 0x1f) >> 3;
-                gif->frame[j] = (uint8_t)((r << 5) | (g << 2) | b);
+            for (int y = 0; y < h; y++) {
+                const uint8_t *brow = bay[y & 3];
+                for (int x = 0; x < w; x++) {
+                    uint16_t p = px[y * w + x];
+                    int t = brow[x & 3] * 16;
+                    int r8 = ((p >> 11) & 0x1f); r8 = (r8 << 3) | (r8 >> 2);
+                    int g8 = ((p >> 5) & 0x3f);  g8 = (g8 << 2) | (g8 >> 4);
+                    int b8 = (p & 0x1f);         b8 = (b8 << 3) | (b8 >> 2);
+                    int r = (r8 * 7 + t) / 255; if (r > 7) r = 7;
+                    int g = (g8 * 7 + t) / 255; if (g > 7) g = 7;
+                    int b = (b8 * 3 + t) / 255; if (b > 3) b = 3;
+                    gif->frame[y * w + x] = (uint8_t)((r << 5) | (g << 2) | b);
+                }
             }
             ge_add_frame(gif, 12);   /* ~120 ms/frame ~ real-time */
             added++;
@@ -1255,9 +1301,22 @@ static void webhook_task(void *arg) {
            and building the GIF can be slow under SD load; never let it delay the alert.
            (GIF timeliness is handled by the frame ring, built right after.) */
         if (buf) { telegram_send_photo(caption, buf, blen); free(buf); }
+        /* Wait for the delayed ring snapshot (usually ready long before the photo
+           upload finishes). If the recorder stalled, claim it back and snapshot now. */
+        for (int i = 0; i < 50 && !job->snap_ready; i++) vTaskDelay(pdMS_TO_TICKS(100));
+        if (!job->snap_ready && gif_ring_lock &&
+            xSemaphoreTake(gif_ring_lock, portMAX_DELAY) == pdTRUE) {
+            if (gif_snap_pending == job) {
+                gif_ring_snapshot_locked(job);
+                gif_snap_pending = NULL;
+                job->snap_ready = true;
+            }
+            xSemaphoreGive(gif_ring_lock);
+        }
+        for (int i = 0; i < 20 && !job->snap_ready; i++) vTaskDelay(pdMS_TO_TICKS(50));
         char gif_path[64];
         snprintf(gif_path, sizeof(gif_path), "/sdcard/event-%p.gif", (void *)job);
-        if (make_event_gif(gif_path, job)) telegram_send_gif(caption, gif_path);
+        if (job->snap_ready && make_event_gif(gif_path, job)) telegram_send_gif(caption, gif_path);
         unlink(gif_path);
     }
     webhook_job_free(job);
@@ -1274,10 +1333,27 @@ static void webhook_notify(const char *event) {
     if (!job) return;
     job->event = strdup(event);
     if (!job->event) { webhook_job_free(job); return; }
-    /* GIF data is only needed for Telegram. Capture it now, before this task can
-       spend seconds uploading the event photo. A failed snapshot simply omits GIF. */
-    if (tg_token[0] && tg_chat[0] && sd_ready) gif_ring_snapshot(job);
-    if (xTaskCreate(webhook_task, "webhook", 8192, job, 5, NULL) != pdPASS) webhook_job_free(job);
+    /* GIF frames are only needed for Telegram. If the recorder is running, schedule
+       a DELAYED snapshot (~1.2 s after the trigger) so the ring covers the event
+       itself, not just the empty scene before it. Otherwise snapshot right away. */
+    if (tg_token[0] && tg_chat[0] && sd_ready) {
+        bool scheduled = false;
+        if (rec_enabled && camera_ready && gif_ring_lock &&
+            xSemaphoreTake(gif_ring_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (!gif_snap_pending) { gif_snap_pending = job; gif_snap_countdown = 12; scheduled = true; }
+            xSemaphoreGive(gif_ring_lock);
+        }
+        if (!scheduled && gif_ring_snapshot(job)) job->snap_ready = true;
+    } else {
+        job->snap_ready = true;    /* nothing to wait for */
+    }
+    if (xTaskCreate(webhook_task, "webhook", 8192, job, 5, NULL) != pdPASS) {
+        if (gif_ring_lock && xSemaphoreTake(gif_ring_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (gif_snap_pending == job) gif_snap_pending = NULL;
+            xSemaphoreGive(gif_ring_lock);
+        }
+        webhook_job_free(job);
+    }
 }
 
 /* POST a lightweight "stop" webhook with a download URL for the finalized clip
@@ -1426,6 +1502,7 @@ static void rec_task(void *arg) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
         gif_ring_push(fb);   /* keep recent frames for a fast, clean event GIF */
+        gif_ring_tick();     /* fire a pending delayed event-GIF snapshot */
 
         /* Motion gate: when enabled, only record while there is motion (+ tail). */
         if (motion_enabled) {
